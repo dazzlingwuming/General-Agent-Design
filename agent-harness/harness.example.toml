@@ -1,0 +1,37 @@
+[provider]
+name = "deepseek"
+model = "deepseek-v4-flash"
+base_url = "https://api.deepseek.com"
+timeout_seconds = 120
+max_attempts = 3
+
+[agent]
+temperature = 0.0
+max_output_tokens = 4096
+
+[run]
+max_iterations = 20
+max_model_calls = 20
+max_tool_calls = 50
+max_wall_time_seconds = 900
+
+[tools]
+default_timeout_seconds = 30
+max_result_chars = 20000
+
+[context]
+char_to_token_ratio = 4.0
+max_estimated_input_tokens = 120000
+recent_turns = 3
+
+[trace]
+directory = ".harness/runs"
+session_directory = ".harness/sessions"
+fail_on_write_error = true
+
+[subagents]
+max_concurrent = 3
+max_total = 8
+max_depth = 1
+max_turns_per_thread = 4
+max_followup_message_chars = 8000
