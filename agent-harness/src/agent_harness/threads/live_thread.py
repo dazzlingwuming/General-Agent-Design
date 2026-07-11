@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -8,8 +7,8 @@ from typing import Any
 from agent_harness.rollout.items import RolloutItem
 from agent_harness.threads.recorder import RolloutRecorder
 from agent_harness.turns.state import ThreadState, ThreadStatus
-from agent_harness.utils.serialization import to_jsonable
 from agent_harness.utils.time import iso_now
+from agent_harness.utils.atomic_files import atomic_write_json
 
 
 @dataclass(slots=True)
@@ -64,8 +63,7 @@ async def asyncio_to_thread_write_json(path: Path, payload: dict[str, Any]) -> N
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     """Write one formatted JSON object to disk."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(to_jsonable(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(path, payload)
 
 
 def _thread_metadata(state: ThreadState) -> dict[str, Any]:
@@ -76,6 +74,8 @@ def _thread_metadata(state: ThreadState) -> dict[str, Any]:
         "parent_thread_id": state.parent_thread_id,
         "forked_from_id": state.forked_from_id,
         "workspace_root": str(state.workspace_root),
+        "project_root": str(state.project_root or state.workspace_root),
+        "cwd": str(state.cwd or state.workspace_root),
         "name": state.metadata.get("name"),
         "preview": state.metadata.get("preview"),
         "status": state.status.value if isinstance(state.status, ThreadStatus) else state.status,

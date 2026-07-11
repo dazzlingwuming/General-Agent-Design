@@ -410,7 +410,7 @@ def _phase4_command(command: str, session: ConversationSession) -> bool:
         snapshot = session.manager.guidance_snapshot
         if command == "/guidance reload":
             assert session.thread_id is not None
-            session.manager.initialize_project_context(session.thread_id, session.workspace, project_trusted=session.project_trusted, resume=True)
+            session.manager.reload_guidance(session.thread_id, session.workspace, project_trusted=session.project_trusted)
             snapshot = session.manager.guidance_snapshot
             print("Guidance 已重新加载。")
         if snapshot is None:
@@ -432,7 +432,7 @@ def _phase4_command(command: str, session: ConversationSession) -> bool:
         catalog = session.manager.skill_catalog
         if command == "/skills reload":
             assert session.thread_id is not None
-            session.manager.initialize_project_context(session.thread_id, session.workspace, project_trusted=session.project_trusted, resume=True)
+            session.manager.reload_skills(session.thread_id, session.workspace, project_trusted=session.project_trusted)
             manager = session.manager.skill_manager
             catalog = session.manager.skill_catalog
             print("Skill Catalog 已重新加载；已有 Activation Snapshot 保持不变。")

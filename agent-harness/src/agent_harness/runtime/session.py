@@ -14,6 +14,8 @@ from agent_harness.tracing.jsonl import JsonlTraceSink
 from agent_harness.tracing.summary import write_result_summary
 from agent_harness.turns.state import InputItem, ThreadStatus
 from agent_harness.utils.serialization import to_jsonable
+from agent_harness.project.roots import resolve_project_paths
+from agent_harness.skills.invocation import SkillInvocationRequest, SkillInvocationSource
 
 
 @dataclass(slots=True)
@@ -57,17 +59,21 @@ class ConversationSession:
 
     async def start(self) -> None:
         """Create a new thread and initialize reusable run state."""
+        paths = resolve_project_paths(self.workspace)
+        self.manager.project_paths = paths
         live = await self.store.create_thread(
-            self.workspace.resolve(),
+            paths.workspace_root,
             provider=self.config.provider.name,
             model=self.config.provider.model,
+            project_root=paths.project_root,
+            cwd=paths.cwd,
         )
         self.live_thread = live
         self.thread_id = live.state.thread_id
-        self.state = RunState(task="", workspace_root=self.workspace.resolve())
+        self.state = RunState(task="", workspace_root=paths.workspace_root)
         self.state.run_id = live.state.thread_id
         self.manager.rollout_audit = lambda event, payload: self._record_audit_item(event, None, payload)
-        self.manager.initialize_project_context(self.thread_id, self.workspace, project_trusted=self.project_trusted)
+        self.manager.initialize_project_context(self.thread_id, paths.cwd, project_trusted=self.project_trusted)
         self.manager.rollout_audit = None
 
     async def resume(self, thread_id: str) -> None:
@@ -80,7 +86,9 @@ class ConversationSession:
         self.state.turn_count = live.state.turn_count
         self.state.messages.extend(_messages_from_history(await self.store.load_history(thread_id)))
         self.manager.rollout_audit = lambda event, payload: self._record_audit_item(event, None, payload)
-        self.manager.initialize_project_context(self.thread_id, live.state.workspace_root, project_trusted=self.project_trusted, resume=True)
+        resume_cwd = live.state.cwd or live.state.workspace_root
+        self.manager.project_paths = resolve_project_paths(resume_cwd, live.state.workspace_root)
+        self.manager.initialize_project_context(self.thread_id, resume_cwd, project_trusted=self.project_trusted, resume=True)
         self.manager.rollout_audit = None
 
     async def run_turn(self, user_input: str) -> RunState:
@@ -90,7 +98,7 @@ class ConversationSession:
         assert self.state is not None
         self.manager.reset_turn_context()
         turn_id = f"turn_{self.live_thread.state.turn_count + 1:04d}"
-        user_input = self._activate_explicit_skill(user_input, turn_id)
+        self._queue_explicit_skill(user_input, turn_id)
         input_item = InputItem(text=user_input)
         self.live_thread.state.turn_count += 1
         self.live_thread.state.active_turn_id = turn_id
@@ -196,15 +204,14 @@ class ConversationSession:
             self.manager.working_set.confirmed_paths.add(str(payload["path"]))
         self.live_thread.recorder.record_nowait([self._item(event, turn_id, payload=payload)])
 
-    def _activate_explicit_skill(self, user_input: str, turn_id: str) -> str:
-        """Expand a leading $skill invocation before the user turn enters model history."""
+    def _queue_explicit_skill(self, user_input: str, turn_id: str) -> None:
+        """Queue a leading user Skill request while preserving its original history text."""
         if not user_input.startswith("$") or not self.manager.skill_manager:
-            return user_input
+            return
         token, _, arguments = user_input[1:].partition(" ")
-        activation, created = self.manager.skill_manager.activate(token, arguments.strip(), turn_id, user_invocation=True)
-        event = "skill.activated" if created else "skill.already_active"
-        self._record_audit_item(event, turn_id, {"skill_id": activation.skill_id, "activation_id": activation.activation_id, "explicit": True})
-        return arguments.strip() or f"请按照 Skill {activation.qualified_name} 执行。"
+        self.manager.pending_skill_invocations.append(
+            SkillInvocationRequest(token, arguments.strip(), SkillInvocationSource.USER_EXPLICIT, self.thread_id or "", turn_id)
+        )
 
 
 def _messages_from_history(history: list[RolloutItem]) -> list[CanonicalMessage]:

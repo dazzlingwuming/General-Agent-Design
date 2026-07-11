@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 from agent_harness.skills.models import SkillActivationSnapshot, SkillRecord
 
 
@@ -15,6 +17,8 @@ def read_skill_resource(record: SkillRecord, activation: SkillActivationSnapshot
         raise FileNotFoundError("资源不在 Skill Manifest 中")
     if candidate.stat().st_size > max_bytes:
         raise ValueError("Skill Resource 超过大小限制")
+    if manifest[normalized].content_hash and hashlib.sha256(candidate.read_bytes()).hexdigest() != manifest[normalized].content_hash:
+        raise RuntimeError("Skill Resource 已变化，请重新激活 Skill")
     try:
         return candidate.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:

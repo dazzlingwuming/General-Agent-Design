@@ -7,6 +7,7 @@ from agent_harness.config import HarnessConfig
 from agent_harness.domain.messages import ToolCall
 from agent_harness.providers.fake import FakeModelProvider, ScriptedStep
 from agent_harness.runtime.run_manager import RunManager
+from agent_harness.runtime.session import ConversationSession
 
 
 def submit_review() -> ToolCall:
@@ -66,3 +67,29 @@ async def test_guidance_and_catalog_are_in_system_context_not_history(tmp_path: 
     request = provider.calls
     assert request == 1
     assert all("始终使用中文" not in (message.content or "") for message in state.messages)
+
+
+async def test_user_explicit_fork_skill_preserves_input_and_runs_child(tmp_path: Path) -> None:
+    """Run a user $fork Skill through the shared pipeline and retain original history."""
+    workspace = Path(__file__).parents[1] / "fixtures" / "demo_repo"
+    config = HarnessConfig()
+    config.provider.name = "fake"
+    config.guidance.require_workspace_trust = False
+    config.skills.require_workspace_trust = False
+    config.trace.directory = tmp_path / "runs"
+    config.trace.thread_directory = tmp_path / "threads"
+    provider = FakeModelProvider(
+        scripts_by_agent={
+            "coding_assistant": [ScriptedStep(content="已整合 reviewer 的结果。")],
+            "reviewer": [ScriptedStep(tool_calls=[submit_review()])],
+        }
+    )
+    session = ConversationSession(config, RunManager(config, provider), workspace, project_trusted=True)
+    await session.start()
+    state = await session.run_turn("$code-review-fork 检查价格逻辑")
+    await session.close()
+    assert state.status.value == "COMPLETED"
+    assert state.agent_summary and state.agent_summary["succeeded"] == 1
+    history = await session.store.load_history(session.thread_id or "")
+    assert any(item.item_type == "user_message" and item.payload["text"] == "$code-review-fork 检查价格逻辑" for item in history)
+    assert any(item.item_type == "skill.invocation_requested" and item.payload["invocation_source"] == "user_explicit" for item in history)

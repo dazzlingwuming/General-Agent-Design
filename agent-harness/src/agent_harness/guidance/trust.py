@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+
+from agent_harness.utils.atomic_files import atomic_write_json
 
 
 class WorkspaceTrustState(StrEnum):
@@ -21,11 +24,14 @@ class WorkspaceTrustStore:
 
     path: Path
     once_roots: set[str] | None = None
+    _lock: threading.RLock | None = None
 
     def __post_init__(self) -> None:
         """Initialize the process-local trust-once collection."""
         if self.once_roots is None:
             self.once_roots = set()
+        if self._lock is None:
+            self._lock = threading.RLock()
 
     def identity(self, workspace: Path) -> str:
         """Return a normalized case-insensitive identity for one workspace root."""
@@ -45,10 +51,11 @@ class WorkspaceTrustStore:
             assert self.once_roots is not None
             self.once_roots.add(identity)
             return
-        data = self._read()
-        data[identity] = state.value
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        assert self._lock is not None
+        with self._lock:
+            data = self._read()
+            data[identity] = state.value
+            atomic_write_json(self.path, data)
 
     def _read(self) -> dict[str, str]:
         """Read valid trust rows and recover safely from missing or malformed files."""

@@ -47,13 +47,17 @@ class GuidanceManager:
             document = self._load(path, kind, boundary, precedence, trusted, diagnostics)
             if document is None:
                 continue
+            if not trusted and kind in {GuidanceSourceKind.PROJECT, GuidanceSourceKind.PATH_RULE}:
+                diagnostics.append(GuidanceDiagnostic("warning", "document_skipped_untrusted", "Untrusted project guidance was not loaded", str(path)))
+                continue
             if total + document.byte_size > self.max_guidance_bytes:
                 omitted.append(str(path))
+                diagnostics.append(GuidanceDiagnostic("warning", "document_skipped_budget", "Guidance document exceeded the remaining budget", str(path)))
                 continue
             total += document.byte_size
             if kind == GuidanceSourceKind.PATH_RULE:
                 rules.append(document)
-            elif trusted or kind != GuidanceSourceKind.PROJECT:
+            else:
                 documents.append(document)
         combined = hashlib.sha256("\n".join(item.content_hash for item in [*documents, *rules]).encode()).hexdigest()
         return GuidanceSnapshot(

@@ -113,6 +113,10 @@ class SkillsConfig:
     max_skill_scan_depth: int = 6
     max_skill_directories: int = 2000
     max_resource_bytes: int = 100000
+    max_skill_file_bytes: int = 1048576
+    max_frontmatter_bytes: int = 16384
+    max_skill_body_bytes: int = 524288
+    max_resource_files_per_skill: int = 200
     support_fork_context: bool = True
     disabled_skill_ids: tuple[str, ...] = ()
 
@@ -263,6 +267,10 @@ def load_config(path: Path | None = None) -> HarnessConfig:
         max_skill_scan_depth=int(skills_data.get("max_skill_scan_depth", 6)),
         max_skill_directories=int(skills_data.get("max_skill_directories", 2000)),
         max_resource_bytes=int(skills_data.get("max_resource_bytes", 100000)),
+        max_skill_file_bytes=int(skills_data.get("max_skill_file_bytes", 1048576)),
+        max_frontmatter_bytes=int(skills_data.get("max_frontmatter_bytes", 16384)),
+        max_skill_body_bytes=int(skills_data.get("max_skill_body_bytes", 524288)),
+        max_resource_files_per_skill=int(skills_data.get("max_resource_files_per_skill", 200)),
         support_fork_context=bool(skills_data.get("support_fork_context", True)),
         disabled_skill_ids=tuple(
             str(item.get("id")) for item in skills_data.get("config", []) if isinstance(item, dict) and item.get("enabled") is False

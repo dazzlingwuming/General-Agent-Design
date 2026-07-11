@@ -6,6 +6,7 @@ from typing import Any, Callable
 import json
 import os
 from dataclasses import replace
+from enum import StrEnum
 
 from agent_harness.agents.registry import create_default_agent_registry
 from agent_harness.config import HarnessConfig
@@ -40,10 +41,24 @@ from agent_harness.skills.discovery import SkillDiscovery, SkillSearchPath
 from agent_harness.skills.models import SkillCatalogSnapshot, SkillScope
 from agent_harness.skills.models import SkillActivationSnapshot
 from agent_harness.domain.subagents import DelegationRequest
+from agent_harness.project.roots import ProjectPaths, resolve_project_paths
+from agent_harness.skills.execution import SkillExecutionRegistry
+from agent_harness.skills.invocation import SkillInvocationRequest, SkillInvocationService
+from agent_harness.utils.atomic_files import atomic_write_json
+
+
+class SubsystemInitState(StrEnum):
+    """Independent initialization state for one optional project subsystem."""
+
+    NOT_INITIALIZED = "not_initialized"
+    INITIALIZED = "initialized"
+    DISABLED = "disabled"
+    FAILED = "failed"
 
 
 @dataclass(slots=True)
 class RunManager:
+    """Compose one root runtime while retaining thread-scoped project context."""
     config: HarnessConfig
     provider: ModelProvider
     approval_handler: ApprovalHandler = field(default_factory=DenyApprovalHandler)
@@ -52,10 +67,17 @@ class RunManager:
     skill_catalog: SkillCatalogSnapshot | None = None
     skill_manager: SkillManager | None = None
     working_set: WorkingSet = field(default_factory=WorkingSet)
+    project_paths: ProjectPaths | None = None
+    guidance_init_state: SubsystemInitState = SubsystemInitState.NOT_INITIALIZED
+    skills_init_state: SubsystemInitState = SubsystemInitState.NOT_INITIALIZED
+    skill_executions: SkillExecutionRegistry = field(default_factory=SkillExecutionRegistry)
+    pending_skill_invocations: list[SkillInvocationRequest] = field(default_factory=list)
 
     async def run(self, task: str, workspace: Path) -> RunState:
         """Create a run state, wire dependencies, execute the loop, and save summary."""
-        root = workspace.resolve()
+        paths = resolve_project_paths(workspace)
+        root = paths.workspace_root
+        self.project_paths = paths
         state = RunState(task=task, workspace_root=root)
         state.messages.append(CanonicalMessage(role="user", content=task))
         return await self.run_existing(state, self.config.trace.directory)
@@ -63,6 +85,7 @@ class RunManager:
     async def run_existing(self, state: RunState, trace_root: Path) -> RunState:
         """Run one turn against an existing state so interactive sessions keep history."""
         root = state.workspace_root.resolve()
+        paths = self.project_paths or resolve_project_paths(root, root)
         trace = JsonlTraceSink(state.run_id, trace_root, fail_on_write_error=self.config.trace.fail_on_write_error)
         trace.emit(
             "run.created" if state.turn_count <= 1 else "turn.created",
@@ -83,8 +106,7 @@ class RunManager:
         )
         sandbox_backend = SandboxManager(security.sandbox_backend, security.wsl_distribution).create_backend(security.sandbox_mode)
         registry = create_default_registry(root, self.config.tools.default_timeout_seconds, sandbox_backend=sandbox_backend, sandbox_policy=policy)
-        if self.guidance_snapshot is None or self.skill_manager is None:
-            self.initialize_project_context(state.run_id, root, project_trusted=not self.config.guidance.require_workspace_trust)
+        self.initialize_project_context(state.run_id, paths.cwd, project_trusted=not self.config.guidance.require_workspace_trust)
         agent_registry = create_default_agent_registry(self.config.provider.model, self.config.provider.name, self.config.run)
         scheduler = SubagentScheduler(
             run_id=state.run_id,
@@ -97,21 +119,25 @@ class RunManager:
             max_total=self.config.subagents.max_total,
             max_depth=self.config.subagents.max_depth,
         )
-        if self.skill_manager and self.skill_catalog and self.skill_catalog.skills:
+        invocation_service = SkillInvocationService(self.skill_manager, self.skill_executions, self._rollout_event, lambda activation: self._delegate_fork_skill(scheduler, activation)) if self.skill_manager else None
+        if invocation_service and self.skill_catalog and any(not item.disable_model_invocation for item in invocation_service.manager.records):
             registry.register(
                 create_activate_skill_tool(
-                    self.skill_manager,
+                    invocation_service,
                     lambda: state.turn_id or "turn_unknown",
+                    lambda: state.run_id,
                     self._rollout_event,
-                    lambda activation: self._delegate_fork_skill(scheduler, activation),
                 )
             )
+        if self.skill_manager and (self.skill_manager.records or self.skill_manager.active):
             registry.register(create_read_skill_resource_tool(self.skill_manager, self.config.skills.max_resource_bytes, self._rollout_event))
         register_subagent_control_tools(registry, scheduler, self.config.tools.default_timeout_seconds)
         agent_registry.validate(registry.names() | {"submit_result"})
         agent = agent_registry.get("coding_assistant")
-        if self.skill_manager and self.skill_catalog and self.skill_catalog.skills:
-            agent.enabled_tools.extend(["activate_skill", "read_skill_resource"])
+        if "activate_skill" in registry.names():
+            agent.enabled_tools.append("activate_skill")
+        if "read_skill_resource" in registry.names():
+            agent.enabled_tools.append("read_skill_resource")
         agent.system_prompt = (
             SYSTEM_PROMPT
             + "\n\n子 Agent 可用角色：\n"
@@ -131,7 +157,7 @@ class RunManager:
                 ),
                 skill_catalog=self.skill_catalog,
                 active_skills_provider=lambda: tuple(self.skill_manager.active) if self.skill_manager else (),
-                enabled_tools_provider=self._effective_skill_tools,
+                enabled_tools_provider=lambda tools: self._effective_skill_tools(state.turn_id or "turn_unknown", tools),
             ),
             tool_runtime=ToolRuntime(
                 registry=registry,
@@ -150,12 +176,20 @@ class RunManager:
             ),
             sandbox_mode=security.sandbox_mode,
             approval_policy=security.approval_policy,
-            enabled_tools_provider=self._effective_skill_tools,
+            enabled_tools_provider=lambda tools: self._effective_skill_tools(state.turn_id or "turn_unknown", tools),
             tool_success_callback=lambda name, arguments: self._update_working_set(root, name, arguments),
         )
         try:
+            if invocation_service:
+                pending = list(self.pending_skill_invocations)
+                self.pending_skill_invocations.clear()
+                for request in pending:
+                    result = await invocation_service.invoke(request)
+                    if result.delegated_result is not None:
+                        state.messages.append(CanonicalMessage(role="user", content=f"Skill 子 Agent 结构化结果：\n{json.dumps(result.delegated_result, ensure_ascii=False)}"))
             return await loop.run(state)
         finally:
+            self.skill_executions.finish_turn(state.turn_id or "turn_unknown")
             if scheduler.active_agent_ids():
                 await scheduler.cancel_all()
             state.agent_summary = scheduler.summary()
@@ -164,13 +198,17 @@ class RunManager:
 
     def initialize_project_context(self, thread_id: str, workspace: Path, *, project_trusted: bool, resume: bool = False) -> None:
         """Discover and persist stable Guidance and Skill metadata for one thread runtime."""
-        root = workspace.resolve()
+        paths = resolve_project_paths(workspace, self.project_paths.workspace_root if self.project_paths else None)
+        self.project_paths = paths
+        root = paths.project_root
         user_root = Path(os.getenv("APPDATA", Path.home())) / "agent-harness"
         admin_root = Path(os.getenv("PROGRAMDATA", "C:/ProgramData")) / "AgentHarness"
-        if self.config.guidance.enabled:
+        if not self.config.guidance.enabled:
+            self.guidance_init_state = SubsystemInitState.DISABLED
+        elif self.guidance_init_state == SubsystemInitState.NOT_INITIALIZED:
             manager = GuidanceManager(
-                workspace=root,
-                cwd=root,
+                workspace=paths.workspace_root,
+                cwd=paths.cwd,
                 user_root=user_root,
                 admin_root=admin_root,
                 fallback_filenames=self.config.guidance.project_doc_fallback_filenames,
@@ -187,44 +225,64 @@ class RunManager:
             snapshot_dir.mkdir(parents=True, exist_ok=True)
             old_hashes = {path.stem.removeprefix("guidance-") for path in snapshot_dir.glob("guidance-*.json")}
             path = snapshot_dir / f"guidance-{self.guidance_snapshot.combined_hash}.json"
-            path.write_text(json.dumps(self.guidance_snapshot.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+            atomic_write_json(path, self.guidance_snapshot.to_dict())
             changed = (previous is not None and previous.combined_hash != self.guidance_snapshot.combined_hash) or (resume and bool(old_hashes) and self.guidance_snapshot.combined_hash not in old_hashes)
             event = "guidance.snapshot_changed" if changed else "guidance.snapshot_created"
             self._rollout_event(event, {"snapshot_id": self.guidance_snapshot.snapshot_id, "combined_hash": self.guidance_snapshot.combined_hash})
-        if self.config.skills.enabled:
-            paths = [
+            self.guidance_init_state = SubsystemInitState.INITIALIZED
+        if not self.config.skills.enabled:
+            self.skills_init_state = SubsystemInitState.DISABLED
+        elif self.skills_init_state == SubsystemInitState.NOT_INITIALIZED:
+            search_paths = [
                 SkillSearchPath(SkillScope.BUNDLED, Path(__file__).parents[1] / "bundled_skills", "bundled"),
                 SkillSearchPath(SkillScope.ADMIN, admin_root / "skills", "admin"),
                 SkillSearchPath(SkillScope.USER, user_root / "skills", "user"),
                 SkillSearchPath(SkillScope.USER, Path.home() / ".agents" / "skills", "user"),
             ]
-            for skills_root in sorted(path for path in root.rglob(".agents/skills") if path.is_dir()):
-                owner = skills_root.parent.parent
+            for owner in paths.scope_chain():
+                skills_root = owner / ".agents" / "skills"
+                if not skills_root.is_dir():
+                    continue
                 relative = owner.relative_to(root).as_posix()
                 prefix = "project" if relative == "." else f"project:{relative}"
-                paths.append(SkillSearchPath(SkillScope.PROJECT, skills_root, prefix, project_trusted))
-            discovery = SkillDiscovery(tuple(paths), self.config.skills.max_skills, self.config.skills.max_skill_scan_depth, self.config.skills.max_skill_directories)
+                search_paths.append(SkillSearchPath(SkillScope.PROJECT, skills_root, prefix, project_trusted))
+            discovery = SkillDiscovery(
+                tuple(search_paths),
+                self.config.skills.max_skills,
+                self.config.skills.max_skill_scan_depth,
+                self.config.skills.max_skill_directories,
+                self.config.skills.max_skill_file_bytes,
+                self.config.skills.max_frontmatter_bytes,
+                self.config.skills.max_resource_files_per_skill,
+            )
             records, diagnostics = discovery.discover()
             records = tuple(replace(record, enabled=False) if record.skill_id in self.config.skills.disabled_skill_ids else record for record in records)
             catalog_chars = int(self.config.context.max_estimated_input_tokens * self.config.skills.catalog_context_ratio * self.config.context.char_to_token_ratio)
             self.skill_catalog = build_catalog(records, diagnostics, max_chars=catalog_chars or self.config.skills.catalog_fallback_max_chars)
-            self.skill_manager = SkillManager(records, self.config.trace.thread_directory / thread_id / "snapshots" / "skills")
+            self.skill_manager = SkillManager(records, self.config.trace.thread_directory / thread_id / "snapshots" / "skills", max_skill_body_bytes=self.config.skills.max_skill_body_bytes)
             if resume:
                 self.skill_manager.resume()
             self._rollout_event("skill.catalog_created", {"catalog_id": self.skill_catalog.catalog_id, "skill_count": len(records), "char_count": self.skill_catalog.char_count})
+            self.skills_init_state = SubsystemInitState.INITIALIZED
+        self._rollout_event("project.paths_resolved", {"project_root": str(paths.project_root), "workspace_root": str(paths.workspace_root), "cwd": str(paths.cwd)})
 
     def reset_turn_context(self) -> None:
         """Start a fresh Working Set while keeping active Skills durable across turns."""
         self.working_set = WorkingSet()
 
-    def _effective_skill_tools(self, agent_tools: list[str]) -> list[str]:
-        """Intersect Agent tools with every active Skill restriction without granting new tools."""
-        allowed = set(agent_tools)
-        if self.skill_manager:
-            for activation in self.skill_manager.active:
-                if activation.allowed_tools:
-                    allowed.intersection_update(activation.allowed_tools)
-        return [name for name in agent_tools if name in allowed]
+    def reload_guidance(self, thread_id: str, cwd: Path, *, project_trusted: bool) -> None:
+        """Reload Guidance without changing the Skill catalog or active snapshots."""
+        self.guidance_init_state = SubsystemInitState.NOT_INITIALIZED
+        self.initialize_project_context(thread_id, cwd, project_trusted=project_trusted, resume=True)
+
+    def reload_skills(self, thread_id: str, cwd: Path, *, project_trusted: bool) -> None:
+        """Reload the Skill catalog and restore durable activations without touching Guidance."""
+        self.skills_init_state = SubsystemInitState.NOT_INITIALIZED
+        self.initialize_project_context(thread_id, cwd, project_trusted=project_trusted, resume=True)
+
+    def _effective_skill_tools(self, turn_id: str, agent_tools: list[str]) -> list[str]:
+        """Apply only active inline executions from the current root turn."""
+        return self.skill_executions.effective_tools_for(turn_id, "coding_assistant", agent_tools)
 
     async def _delegate_fork_skill(self, scheduler: SubagentScheduler, activation: SkillActivationSnapshot) -> dict[str, Any]:
         """Run a fork-context Skill in its declared child agent and return structured output."""

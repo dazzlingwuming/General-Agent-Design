@@ -20,7 +20,7 @@ class LocalThreadStore:
         """Create a local thread store under the supplied root directory."""
         self.root = root
 
-    async def create_thread(self, workspace_root: Path, *, provider: str, model: str) -> LiveThread:
+    async def create_thread(self, workspace_root: Path, *, provider: str, model: str, project_root: Path | None = None, cwd: Path | None = None) -> LiveThread:
         """Create a new local thread and persist its metadata plus thread.created item."""
         thread_id = new_id("thread")
         state = ThreadState(
@@ -28,6 +28,8 @@ class LocalThreadStore:
             session_id=thread_id,
             workspace_root=workspace_root.resolve(),
             status=ThreadStatus.IDLE,
+            project_root=(project_root or workspace_root).resolve(),
+            cwd=(cwd or workspace_root).resolve(),
             metadata={"model_provider": provider, "model": model, "archived": False},
         )
         live = self._live_thread(state)
@@ -108,6 +110,8 @@ class LocalThreadStore:
             session_id=str(metadata.get("session_id") or metadata["thread_id"]),
             workspace_root=Path(str(metadata["workspace_root"])),
             status=ThreadStatus(str(metadata.get("status") or ThreadStatus.IDLE.value)),
+            project_root=Path(str(metadata.get("project_root") or metadata["workspace_root"])),
+            cwd=Path(str(metadata.get("cwd") or metadata["workspace_root"])),
             parent_thread_id=metadata.get("parent_thread_id"),
             forked_from_id=metadata.get("forked_from_id"),
             active_turn_id=metadata.get("last_turn_id"),

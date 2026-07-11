@@ -9,6 +9,7 @@ from pathlib import Path
 from agent_harness.skills.models import SkillActivationSnapshot, SkillRecord, SkillResource
 from agent_harness.skills.parser import split_skill_file
 from agent_harness.utils.ids import new_id
+from agent_harness.utils.atomic_files import atomic_write_json
 
 POSITIONAL_RE = re.compile(r"\$(?:ARGUMENTS\[(\d+)\]|(\d+))")
 
@@ -20,6 +21,7 @@ class SkillManager:
     records: tuple[SkillRecord, ...]
     snapshot_root: Path
     active: list[SkillActivationSnapshot] = field(default_factory=list)
+    max_skill_body_bytes: int = 524288
 
     def resolve(self, name: str, *, user_invocation: bool = False) -> SkillRecord:
         """Resolve a qualified or unambiguous short skill name with invocation gates."""
@@ -43,6 +45,8 @@ class SkillManager:
         record = self.resolve(name, user_invocation=user_invocation)
         raw = record.skill_path.read_text(encoding="utf-8")
         _, body = split_skill_file(raw)
+        if len(body.encode("utf-8")) > self.max_skill_body_bytes:
+            raise ValueError("Skill 正文超过大小限制")
         rendered = render_arguments(body, arguments)
         content_hash = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
         for activation in self.active:
@@ -87,7 +91,7 @@ class SkillManager:
         """Write one immutable activation snapshot under the owning thread."""
         self.snapshot_root.mkdir(parents=True, exist_ok=True)
         path = self.snapshot_root / f"{activation.activation_id}.json"
-        path.write_text(json.dumps(activation.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_json(path, activation.to_dict())
 
 
 def render_arguments(body: str, arguments: str) -> str:

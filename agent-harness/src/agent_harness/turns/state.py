@@ -68,6 +68,8 @@ class ThreadState:
     session_id: str
     workspace_root: Path
     status: ThreadStatus
+    project_root: Path | None = None
+    cwd: Path | None = None
     parent_thread_id: str | None = None
     forked_from_id: str | None = None
     main_agent_id: str = "coding_assistant"

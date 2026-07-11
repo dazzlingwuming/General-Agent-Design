@@ -32,6 +32,7 @@ class SkillResource:
     relative_path: str
     kind: str
     byte_size: int
+    content_hash: str = ""
 
 
 @dataclass(frozen=True, slots=True)
