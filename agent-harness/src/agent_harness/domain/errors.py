@@ -81,6 +81,12 @@ class ToolInputValidationError(HarnessError):
     recoverable = True
 
 
+class ToolAuthorizationError(HarnessError):
+    code = "TOOL_AUTHORIZATION"
+    category = "tool"
+    recoverable = True
+
+
 class ToolExecutionError(HarnessError):
     code = "TOOL_EXECUTION_ERROR"
     category = "tool"

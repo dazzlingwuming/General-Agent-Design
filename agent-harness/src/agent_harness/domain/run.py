@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from datetime import datetime
 
 from agent_harness.domain.errors import RunError
 from agent_harness.domain.messages import CanonicalMessage
@@ -44,9 +45,9 @@ class RunState:
     model_call_count: int = 0
     tool_call_count: int = 0
     usage_total: Usage = field(default_factory=Usage)
-    started_at: object = field(default_factory=utc_now)
-    updated_at: object = field(default_factory=utc_now)
-    completed_at: object | None = None
+    started_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
+    completed_at: datetime | None = None
     final_output: str | None = None
     error: RunError | None = None
     cancellation_requested: bool = False

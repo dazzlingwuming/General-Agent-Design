@@ -2,6 +2,7 @@
 name = "deepseek"
 model = "deepseek-v4-flash"
 base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
 timeout_seconds = 120
 max_attempts = 3
 
@@ -26,6 +27,7 @@ recent_turns = 3
 
 [trace]
 directory = ".harness/runs"
+thread_directory = ".harness/threads"
 session_directory = ".harness/sessions"
 fail_on_write_error = true
 
@@ -35,3 +37,61 @@ max_total = 8
 max_depth = 1
 max_turns_per_thread = 4
 max_followup_message_chars = 8000
+
+[security]
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+sandbox_required = true
+trusted_project = false
+
+[security.network]
+mode = "none"
+
+[security.environment]
+allow = ["PATH", "LANG", "LC_ALL", "TERM", "SYSTEMROOT", "WINDIR"]
+
+[security.sandbox]
+backend = "auto"
+default_timeout_seconds = 120
+max_output_chars = 50000
+# Windows 可指定已安装且包含 bubblewrap 的 WSL2 发行版：
+# wsl_distribution = "Ubuntu"
+
+[guidance]
+enabled = true
+max_guidance_bytes = 32768
+max_import_depth = 4
+max_import_files = 32
+max_import_total_bytes = 32768
+project_doc_fallback_filenames = ["CLAUDE.md"]
+require_workspace_trust = true
+
+[guidance.rules]
+activate_search_candidates = false
+
+[skills]
+enabled = true
+require_workspace_trust = true
+catalog_context_ratio = 0.02
+catalog_fallback_max_chars = 8000
+max_skills = 500
+max_skill_scan_depth = 6
+max_skill_directories = 2000
+max_resource_bytes = 100000
+support_fork_context = true
+
+[[skills.config]]
+id = "user:deploy-production"
+enabled = false
+
+[[permissions.rules]]
+id = "deny-git-push"
+decision = "deny"
+tool = "run_command"
+argv_prefix = ["git", "push"]
+
+[[permissions.rules]]
+id = "allow-pytest"
+decision = "allow"
+tool = "run_command"
+argv_prefix = ["pytest"]

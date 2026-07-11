@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import getpass
-
 from agent_harness.cli import main
 
 
@@ -38,15 +36,17 @@ def test_cli_exec_accepts_task_and_workspace(tmp_path, capsys):
 
 
 def test_cli_setup_writes_user_config(tmp_path, monkeypatch, capsys):
-    """Verify that setup prompts for credentials and writes user config."""
-    answers = iter(["https://example.invalid", "2"])
+    """Verify that setup writes provider config without persisting an API key."""
+    answers = iter(["https://example.invalid", "DEEPSEEK_API_KEY", "2"])
     monkeypatch.setenv("APPDATA", str(tmp_path))
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
-    monkeypatch.setattr(getpass, "getpass", lambda prompt="": "secret-value")
     code = main(["setup"])
     out = capsys.readouterr().out
     assert code == 0
     assert "配置已保存" in out
     saved = tmp_path / "agent-harness" / "config.toml"
     assert saved.exists()
-    assert "deepseek-v4-pro" in saved.read_text(encoding="utf-8")
+    content = saved.read_text(encoding="utf-8")
+    assert "deepseek-v4-pro" in content
+    assert "api_key_env" in content
+    assert "secret-value" not in content

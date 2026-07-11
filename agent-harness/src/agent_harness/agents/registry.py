@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agent_harness.agents.loader import load_agent_definitions
-from agent_harness.agents.outputs import SUBAGENT_RESULT_SCHEMA, OutputSchemaRegistry, create_default_output_registry
+from agent_harness.agents.outputs import OutputSchemaRegistry, create_default_output_registry
 from agent_harness.context.prompt import SYSTEM_PROMPT
 from agent_harness.domain.agent import AgentDefinition
 from agent_harness.domain.run import RunLimits
@@ -97,6 +97,10 @@ def create_default_agent_registry(model: str, provider: str, root_limits: RunLim
                 "list_files",
                 "read_file",
                 "search_text",
+                "write_file",
+                "apply_patch",
+                "delete_path",
+                "run_command",
                 "spawn_subagent",
                 "wait_subagents",
                 "get_subagent_status",

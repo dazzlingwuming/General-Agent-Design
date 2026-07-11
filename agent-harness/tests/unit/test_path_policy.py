@@ -7,7 +7,8 @@ import pytest
 
 from agent_harness.domain.messages import ToolCall
 from agent_harness.tools.builtins.factory import create_default_registry
-from agent_harness.tools.runtime import ToolRuntime
+from agent_harness.tools.runtime import ToolExecutionPrincipal, ToolRuntime
+from agent_harness.security.models import Capability
 from agent_harness.utils.paths import resolve_workspace_path
 
 
@@ -41,6 +42,7 @@ async def test_read_file_blocks_secret_file(tmp_path: Path):
     """Verify that read_file refuses common secret filenames."""
     (tmp_path / ".env").write_text("TOKEN=x", encoding="utf-8")
     runtime = ToolRuntime(create_default_registry(tmp_path))
-    result = await runtime.execute(ToolCall(id="c1", name="read_file", arguments={"path": ".env"}))
+    principal = ToolExecutionPrincipal("thread", "thread", "turn", "agent", allowed_tools=frozenset({"read_file"}), capabilities=frozenset({Capability.FILE_READ}))
+    result = await runtime.execute(ToolCall(id="c1", name="read_file", arguments={"path": ".env"}), principal)
     assert result.status == "error"
-    assert result.error_code == "WORKSPACE_BOUNDARY"
+    assert result.error_code == "TOOL_AUTHORIZATION"

@@ -11,7 +11,8 @@ from agent_harness.domain.messages import CanonicalMessage
 from agent_harness.domain.model import ModelProvider, Usage
 from agent_harness.domain.run import RunState, RunStatus
 from agent_harness.runtime.completion import CompletionPolicy, TextFinalCompletionPolicy
-from agent_harness.tools.runtime import ToolRuntime
+from agent_harness.tools.runtime import ToolExecutionPrincipal, ToolRuntime
+from agent_harness.security.models import ApprovalPolicy, Capability, SandboxMode
 from agent_harness.tracing.jsonl import JsonlTraceSink
 from agent_harness.runtime.budgets import check_iteration, check_model_calls, check_tool_calls, check_wall_time
 from agent_harness.utils.time import utc_now
@@ -28,6 +29,12 @@ class AgentLoop:
     final_guard: Callable[[], str | None] | None = None
     completion_policy: CompletionPolicy | None = None
     mailbox_provider: Callable[[], list[str]] | None = None
+    sandbox_mode: SandboxMode = SandboxMode.WORKSPACE_WRITE
+    approval_policy: ApprovalPolicy = ApprovalPolicy.ON_REQUEST
+    parent_agent_id: str | None = None
+    depth: int = 0
+    enabled_tools_provider: Callable[[list[str]], list[str]] | None = None
+    tool_success_callback: Callable[[str, dict], None] | None = None
 
     async def run(self, state: RunState) -> RunState:
         """Drive the single-agent model/tool loop until completion or failure."""
@@ -69,7 +76,9 @@ class AgentLoop:
                         check_tool_calls(state, self.agent.limits)
                         self.trace.emit("tool.requested", iteration=state.iteration, payload={"tool": call.name, "tool_call_id": call.id})
                         self.trace.emit("tool.started", iteration=state.iteration, payload={"tool": call.name, "tool_call_id": call.id})
-                        result = await self.tool_runtime.execute(call)
+                        result = await self.tool_runtime.execute(call, self._principal(state))
+                        if result.status == "success" and self.tool_success_callback and isinstance(call.arguments, dict):
+                            self.tool_success_callback(call.name, call.arguments)
                         state.tool_call_count += 1
                         state.messages.append(
                             CanonicalMessage(
@@ -125,6 +134,7 @@ class AgentLoop:
                 self.trace.emit("iteration.completed", iteration=state.iteration, payload={"continued": False})
                 self.trace.emit("run.completed", iteration=state.iteration, payload={"final_output_chars": len(final_text)})
                 return state
+            return state
         except asyncio.CancelledError as exc:
             state.status = RunStatus.CANCELLED
             state.completed_at = utc_now()
@@ -164,12 +174,32 @@ class AgentLoop:
 
     def _add_usage(self, state: RunState, usage: Usage) -> None:
         """Accumulate provider token usage fields when the provider returns them."""
-        for field in ("input_tokens", "output_tokens", "total_tokens", "cached_input_tokens"):
-            value = getattr(usage, field)
+        for field_name in ("input_tokens", "output_tokens", "total_tokens", "cached_input_tokens"):
+            value = getattr(usage, field_name)
             if value is None:
                 continue
-            current = getattr(state.usage_total, field)
-            setattr(state.usage_total, field, value if current is None else current + value)
+            current = getattr(state.usage_total, field_name)
+            setattr(state.usage_total, field_name, value if current is None else current + value)
+
+    def _principal(self, state: RunState) -> ToolExecutionPrincipal:
+        """Build the execution principal for the current agent and turn."""
+        capabilities = {Capability.FILE_READ}
+        if self.agent.name == "coding_assistant":
+            capabilities.update({Capability.FILE_WRITE, Capability.FILE_DELETE, Capability.COMMAND_EXECUTE})
+        if self.agent.can_spawn_subagents:
+            capabilities.add(Capability.SUBAGENT_CREATE)
+        return ToolExecutionPrincipal(
+            session_id=state.run_id,
+            thread_id=state.run_id,
+            turn_id=state.turn_id or "turn_unknown",
+            agent_id=self.agent.name,
+            parent_agent_id=self.parent_agent_id,
+            depth=self.depth,
+            allowed_tools=frozenset(self.enabled_tools_provider(self.agent.enabled_tools) if self.enabled_tools_provider else self.agent.enabled_tools),
+            capabilities=frozenset(capabilities),
+            sandbox_mode=self.sandbox_mode,
+            approval_policy=self.approval_policy,
+        )
 
     def _drain_mailbox(self, state: RunState) -> None:
         """Append pending parent follow-up messages at safe model-loop boundaries."""

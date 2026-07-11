@@ -21,12 +21,14 @@ class ToolCall:
 
 @dataclass(slots=True)
 class CanonicalMessage:
+    """Provider-neutral chat message with optional tool and reasoning metadata."""
+
     role: MessageRole
     content: str = ""
+    reasoning_content: str | None = None
     message_id: str = field(default_factory=lambda: new_id("msg"))
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: str | None = None
     tool_name: str | None = None
     created_at: object = field(default_factory=utc_now)
     metadata: dict[str, Any] = field(default_factory=dict)
-

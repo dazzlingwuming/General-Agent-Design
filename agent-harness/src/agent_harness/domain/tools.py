@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Literal
 
 from agent_harness.domain.messages import ToolCall
+from agent_harness.security.models import Capability, RiskLevel, SideEffectType
 from agent_harness.utils.time import utc_now
 
 ToolStatus = Literal["success", "error", "cancelled", "timeout"]
@@ -18,8 +19,21 @@ class ToolDefinition:
     executor: ToolExecutor
     output_schema: dict[str, Any] | None = None
     timeout_seconds: int = 30
-    risk_level: str = "read_only"
-    required_capabilities: list[str] = field(default_factory=lambda: ["FILE_READ"])
+    risk_level: RiskLevel = RiskLevel.READ_ONLY
+    side_effect: SideEffectType = SideEffectType.NONE
+    required_capabilities: frozenset[Capability] = field(default_factory=lambda: frozenset({Capability.FILE_READ}))
+    requires_sandbox: bool = False
+
+    def __post_init__(self) -> None:
+        """Normalize legacy string metadata into the phase 3 security enums."""
+        if not isinstance(self.risk_level, RiskLevel):
+            legacy = str(self.risk_level).upper()
+            self.risk_level = RiskLevel.READ_ONLY if legacy in {"READ_ONLY", "INTERNAL"} else RiskLevel(legacy)
+        if not isinstance(self.side_effect, SideEffectType):
+            self.side_effect = SideEffectType(str(self.side_effect).upper())
+        self.required_capabilities = frozenset(
+            value if isinstance(value, Capability) else Capability(str(value)) for value in self.required_capabilities
+        )
 
     def to_model_schema(self) -> dict[str, Any]:
         """Convert this internal tool definition to a model-visible function schema."""

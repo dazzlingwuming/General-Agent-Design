@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -227,7 +228,9 @@ class SubagentScheduler:
                     depth=thread.depth,
                 )
                 state = self._build_child_run_state(thread, request)
-                definition = self.agent_registry.get(thread.agent_definition_name)
+                definition = copy.copy(self.agent_registry.get(thread.agent_definition_name))
+                if request.allowed_tools:
+                    definition.enabled_tools = [name for name in definition.enabled_tools if name in request.allowed_tools or name == "submit_result"]
                 registry = create_default_registry(self.workspace_root, self.config.tools.default_timeout_seconds)
                 registry.register(create_submit_result_tool(self.config.tools.default_timeout_seconds))
                 loop = AgentLoop(

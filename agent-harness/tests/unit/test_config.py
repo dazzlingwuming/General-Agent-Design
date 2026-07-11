@@ -34,20 +34,23 @@ def test_deepseek_provider_repr_does_not_expose_api_key(monkeypatch):
 
 
 def test_user_config_is_loaded_by_default(tmp_path: Path, monkeypatch):
-    """Verify that default user config is loaded when no config path is passed."""
+    """Verify that default user config is loaded without persisting API key values."""
     monkeypatch.setenv("APPDATA", str(tmp_path))
     write_user_config(
         ProviderConfig(
             name="deepseek",
             model="v4-pro",
             base_url="https://example.invalid",
-            api_key="secret-value",
+            api_key_env="DEEPSEEK_API_KEY",
         )
     )
     config = load_config()
+    content = default_user_config_path().read_text(encoding="utf-8")
     assert default_user_config_path() == tmp_path / "agent-harness" / "config.toml"
     assert config.provider.model == "deepseek-v4-pro"
-    assert config.provider.api_key == "secret-value"
+    assert config.provider.api_key is None
+    assert config.provider.api_key_env == "DEEPSEEK_API_KEY"
+    assert "api_key =" not in content
 
 
 def test_load_config_reads_subagent_limits(tmp_path: Path):

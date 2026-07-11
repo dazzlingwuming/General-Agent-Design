@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
-from agent_harness.domain.messages import CanonicalMessage
 from agent_harness.domain.run import RunState
 
 

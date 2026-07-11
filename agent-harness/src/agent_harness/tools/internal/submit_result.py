@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_harness.agents.registry import SUBAGENT_RESULT_SCHEMA
+from agent_harness.agents.outputs import SUBAGENT_RESULT_SCHEMA
 from agent_harness.domain.errors import ToolInputValidationError
 from agent_harness.domain.tools import ToolDefinition
+from agent_harness.security.models import RiskLevel
 
 
 def create_submit_result_tool(timeout_seconds: int = 30) -> ToolDefinition:
@@ -21,8 +22,8 @@ def create_submit_result_tool(timeout_seconds: int = 30) -> ToolDefinition:
         input_schema=SUBAGENT_RESULT_SCHEMA,
         executor=executor,
         timeout_seconds=timeout_seconds,
-        risk_level="internal",
-        required_capabilities=[],
+        risk_level=RiskLevel.READ_ONLY,
+        required_capabilities=frozenset(),
     )
 
 

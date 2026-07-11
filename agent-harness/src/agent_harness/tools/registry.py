@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import List
+
 from agent_harness.domain.errors import ToolNotFoundError
 from agent_harness.domain.tools import ToolDefinition
 
@@ -24,7 +26,7 @@ class ToolRegistry:
         except KeyError as exc:
             raise ToolNotFoundError(f"Unknown tool: {name}", details={"tool": name}) from exc
 
-    def list(self) -> list[ToolDefinition]:
+    def list(self) -> List[ToolDefinition]:
         """Return all tool definitions in stable name order."""
         return [self._tools[name] for name in sorted(self._tools)]
 
@@ -32,7 +34,7 @@ class ToolRegistry:
         """Return all registered tool names for agent definition validation."""
         return set(self._tools)
 
-    def export_schemas(self, enabled_tools: list[str] | None = None) -> list[dict]:
+    def export_schemas(self, enabled_tools: List[str] | None = None) -> List[dict]:
         """Export model-visible schemas for all tools or an enabled subset."""
         names = enabled_tools if enabled_tools is not None else sorted(self._tools)
         return [self.get(name).to_model_schema() for name in names]

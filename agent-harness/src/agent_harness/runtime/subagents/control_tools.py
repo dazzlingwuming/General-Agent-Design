@@ -4,6 +4,7 @@ from typing import Any
 
 from agent_harness.domain.subagents import DelegationRequest
 from agent_harness.domain.tools import ToolDefinition
+from agent_harness.security.models import Capability, RiskLevel
 from agent_harness.runtime.subagents.scheduler import SubagentScheduler
 from agent_harness.tools.registry import ToolRegistry
 
@@ -50,8 +51,8 @@ def _spawn_tool(scheduler: SubagentScheduler, timeout_seconds: int) -> ToolDefin
         },
         executor=executor,
         timeout_seconds=timeout_seconds,
-        risk_level="internal",
-        required_capabilities=["SUBAGENT_CREATE"],
+        risk_level=RiskLevel.LOW,
+        required_capabilities=frozenset({Capability.SUBAGENT_CREATE}),
     )
 
 
@@ -81,8 +82,8 @@ def _wait_tool(scheduler: SubagentScheduler, timeout_seconds: int) -> ToolDefini
         },
         executor=executor,
         timeout_seconds=timeout_seconds,
-        risk_level="internal",
-        required_capabilities=[],
+        risk_level=RiskLevel.READ_ONLY,
+        required_capabilities=frozenset(),
     )
 
 
@@ -104,8 +105,8 @@ def _status_tool(scheduler: SubagentScheduler, timeout_seconds: int) -> ToolDefi
         },
         executor=executor,
         timeout_seconds=timeout_seconds,
-        risk_level="internal",
-        required_capabilities=[],
+        risk_level=RiskLevel.READ_ONLY,
+        required_capabilities=frozenset(),
     )
 
 
@@ -127,8 +128,8 @@ def _send_message_tool(scheduler: SubagentScheduler, timeout_seconds: int) -> To
         },
         executor=executor,
         timeout_seconds=timeout_seconds,
-        risk_level="internal",
-        required_capabilities=[],
+        risk_level=RiskLevel.LOW,
+        required_capabilities=frozenset(),
     )
 
 
@@ -150,8 +151,8 @@ def _cancel_tool(scheduler: SubagentScheduler, timeout_seconds: int) -> ToolDefi
         },
         executor=executor,
         timeout_seconds=timeout_seconds,
-        risk_level="internal",
-        required_capabilities=[],
+        risk_level=RiskLevel.LOW,
+        required_capabilities=frozenset(),
     )
 
 
@@ -173,7 +174,6 @@ def _close_tool(scheduler: SubagentScheduler, timeout_seconds: int) -> ToolDefin
         },
         executor=executor,
         timeout_seconds=timeout_seconds,
-        risk_level="internal",
-        required_capabilities=[],
+        risk_level=RiskLevel.LOW,
+        required_capabilities=frozenset(),
     )
-

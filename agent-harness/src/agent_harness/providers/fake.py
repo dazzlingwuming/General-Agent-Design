@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from agent_harness.domain.messages import CanonicalMessage, ToolCall
-from agent_harness.domain.model import ModelRequest, ModelResponse, ProviderCapabilities
+from agent_harness.domain.model import FinishReason, ModelRequest, ModelResponse, ProviderCapabilities
+from typing import cast
 from agent_harness.domain.errors import ProviderProtocolError
 
 
@@ -35,7 +36,6 @@ class FakeModelProvider:
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         """Return the next scripted response without calling a network service."""
-        agent_name = request.request_metadata.get("agent_name")
         script_key = self._script_key(request)
         if script_key in self.scripts_by_agent:
             steps = self.scripts_by_agent[script_key]
@@ -62,7 +62,7 @@ class FakeModelProvider:
         return ModelResponse(
             assistant_message=message,
             tool_calls=tool_calls,
-            finish_reason=step.finish_reason or ("tool_calls" if tool_calls else "stop"),
+            finish_reason=cast(FinishReason, step.finish_reason or ("tool_calls" if tool_calls else "stop")),
             model=request.model,
         )
 

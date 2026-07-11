@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -17,7 +17,7 @@ from agent_harness.domain.errors import (
     ProviderTimeoutError,
 )
 from agent_harness.domain.messages import CanonicalMessage, ToolCall
-from agent_harness.domain.model import ModelRequest, ModelResponse, ProviderCapabilities, Usage
+from agent_harness.domain.model import FinishReason, ModelRequest, ModelResponse, ProviderCapabilities, Usage
 
 
 @dataclass(slots=True)
@@ -103,6 +103,8 @@ class DeepSeekProvider:
                 "content": message.content,
             }
         payload: dict[str, Any] = {"role": message.role, "content": message.content or None}
+        if message.reasoning_content:
+            payload["reasoning_content"] = message.reasoning_content
         if message.tool_calls:
             payload["tool_calls"] = [
                 {
@@ -139,7 +141,12 @@ class DeepSeekProvider:
                     sequence_index=index,
                 )
             )
-        assistant = CanonicalMessage(role="assistant", content=msg.get("content") or "", tool_calls=tool_calls)
+        assistant = CanonicalMessage(
+            role="assistant",
+            content=msg.get("content") or "",
+            reasoning_content=msg.get("reasoning_content"),
+            tool_calls=tool_calls,
+        )
         usage_raw = raw.get("usage") or {}
         usage = Usage(
             input_tokens=usage_raw.get("prompt_tokens"),
@@ -161,9 +168,9 @@ class DeepSeekProvider:
         return ModelResponse(
             assistant_message=assistant,
             tool_calls=tool_calls,
-            finish_reason=normalized,
+            finish_reason=cast(FinishReason, normalized),
             usage=usage,
             response_id=raw.get("id"),
             model=raw.get("model"),
-            provider_metadata={"created": raw.get("created")},
+            provider_metadata={"created": raw.get("created"), "reasoning_content": msg.get("reasoning_content")},
         )

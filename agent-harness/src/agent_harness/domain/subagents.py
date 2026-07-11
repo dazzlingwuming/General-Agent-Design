@@ -112,4 +112,4 @@ class DelegationRequest:
     context: str = ""
     expected_focus: str = ""
     idempotency_key: str | None = None
-
+    allowed_tools: tuple[str, ...] = ()

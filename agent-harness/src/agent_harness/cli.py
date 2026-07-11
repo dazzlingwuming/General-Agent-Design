@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import getpass
 import json
 import os
 from pathlib import Path
@@ -12,9 +11,15 @@ from agent_harness.domain.errors import HarnessError
 from agent_harness.domain.run import RunStatus
 from agent_harness.providers.deepseek import DeepSeekProvider
 from agent_harness.providers.fake import default_demo_provider
+from agent_harness.rollout.items import RolloutItem
 from agent_harness.runtime.run_manager import RunManager
 from agent_harness.runtime.session import ConversationSession
+from agent_harness.threads.local_store import LocalThreadStore
 from agent_harness.tools.builtins.factory import create_default_registry
+from agent_harness.security.approval import ConsoleApprovalHandler
+from agent_harness.security.models import ApprovalPolicy, SandboxMode
+from agent_harness.utils.serialization import to_jsonable
+from agent_harness.guidance.trust import WorkspaceTrustState, WorkspaceTrustStore
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,6 +35,9 @@ def build_parser() -> argparse.ArgumentParser:
     code.add_argument("--config")
     code.add_argument("--max-iterations", type=int)
     code.add_argument("--trace-dir")
+    code.add_argument("--sandbox", choices=[mode.value for mode in SandboxMode])
+    code.add_argument("--approval-policy", choices=[policy.value for policy in ApprovalPolicy])
+    code.add_argument("--danger-full-access", action="store_true")
 
     setup = sub.add_parser("setup")
     setup.add_argument("--provider", choices=["deepseek"], default="deepseek")
@@ -42,6 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
     exec_cmd.add_argument("--config")
     exec_cmd.add_argument("--max-iterations", type=int)
     exec_cmd.add_argument("--trace-dir")
+    exec_cmd.add_argument("--sandbox", choices=[mode.value for mode in SandboxMode])
+    exec_cmd.add_argument("--approval-policy", choices=[policy.value for policy in ApprovalPolicy])
+    exec_cmd.add_argument("--danger-full-access", action="store_true")
 
     run = sub.add_parser("run", help=argparse.SUPPRESS)
     run.add_argument("--workspace", required=True)
@@ -51,17 +62,39 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--config")
     run.add_argument("--max-iterations", type=int)
     run.add_argument("--trace-dir")
+    run.add_argument("--sandbox", choices=[mode.value for mode in SandboxMode])
+    run.add_argument("--approval-policy", choices=[policy.value for policy in ApprovalPolicy])
+    run.add_argument("--danger-full-access", action="store_true")
 
     tools = sub.add_parser("tools")
     tools.add_argument("--workspace", default=".")
 
-    sessions = sub.add_parser("sessions")
-    sessions.add_argument("--session-dir", default=".harness/sessions")
+    threads = sub.add_parser("threads")
+    threads.add_argument("--thread-dir", default=".harness/threads")
+
+    sessions = sub.add_parser("sessions", help=argparse.SUPPRESS)
+    sessions.add_argument("--session-dir", default=".harness/threads")
+
+    resume = sub.add_parser("resume")
+    resume.add_argument("thread_id", nargs="?")
+    resume.add_argument("--provider", choices=["deepseek", "fake"])
+    resume.add_argument("--model", choices=sorted(MODEL_ALIASES))
+    resume.add_argument("--config")
+    resume.add_argument("--max-iterations", type=int)
+    resume.add_argument("--trace-dir")
+    resume.add_argument("--sandbox", choices=[mode.value for mode in SandboxMode])
+    resume.add_argument("--approval-policy", choices=[policy.value for policy in ApprovalPolicy])
+    resume.add_argument("--danger-full-access", action="store_true")
 
     inspect = sub.add_parser("inspect")
     inspect.add_argument("id")
     inspect.add_argument("--trace-dir", default=".harness/runs")
     inspect.add_argument("--session", action="store_true")
+    inspect.add_argument("--thread", action="store_true")
+
+    migrate = sub.add_parser("migrate-sessions")
+    migrate.add_argument("--session-dir", default=".harness/sessions")
+    migrate.add_argument("--thread-dir", default=".harness/threads")
     return parser
 
 
@@ -75,6 +108,14 @@ def _apply_common_run_args(config, args: argparse.Namespace) -> None:
         config.run.max_iterations = args.max_iterations
     if args.trace_dir:
         config.trace.directory = Path(args.trace_dir)
+    if getattr(args, "sandbox", None):
+        config.security.sandbox_mode = SandboxMode(args.sandbox)
+    if getattr(args, "approval_policy", None):
+        config.security.approval_policy = ApprovalPolicy(args.approval_policy)
+    if getattr(args, "danger_full_access", False):
+        config.security.sandbox_mode = SandboxMode.DANGER_FULL_ACCESS
+        config.security.approval_policy = ApprovalPolicy.NEVER
+        config.security.full_access_confirmed = True
 
 
 def _resolve_provider(config):
@@ -104,13 +145,11 @@ def _setup(args: argparse.Namespace) -> int:
     print("配置会保存到：")
     print(default_user_config_path())
     base_url = input("请输入 DeepSeek API URL，直接回车使用 https://api.deepseek.com：").strip() or "https://api.deepseek.com"
-    api_key = getpass.getpass("请输入 API Key（输入时不会显示）：").strip()
-    if not api_key:
-        print("API Key 不能为空。")
-        return 2
+    api_key_env = input("请输入保存 API Key 的环境变量名，默认 DEEPSEEK_API_KEY：").strip() or "DEEPSEEK_API_KEY"
     model = _choose_model()
-    path = write_user_config(ProviderConfig(name=args.provider, model=model, base_url=base_url, api_key=api_key))
+    path = write_user_config(ProviderConfig(name=args.provider, model=model, base_url=base_url, api_key_env=api_key_env))
     print(f"配置已保存：{path}")
+    print(f"请在系统环境变量中设置 {api_key_env}，不要把 API Key 写入项目文件或 config.toml。")
     print("以后可以在任意目录运行：agent-harness code")
     return 0
 
@@ -171,12 +210,12 @@ async def _interactive(args: argparse.Namespace) -> int:
         print("还没有配置 API Key。请先运行：agent-harness setup")
         return 2
     provider = _resolve_provider(config)
-    manager = RunManager(config=config, provider=provider)
-    session = ConversationSession(config=config, manager=manager, workspace=Path.cwd())
-    session.start()
-    print(f"Session ID: {session.session_id}")
+    manager = RunManager(config=config, provider=provider, approval_handler=ConsoleApprovalHandler())
+    session = ConversationSession(config=config, manager=manager, workspace=Path.cwd(), project_trusted=_resolve_workspace_trust(Path.cwd(), config))
+    await session.start()
+    print(f"Thread ID: {session.session_id}")
     print(f"Workspace: {Path.cwd()}")
-    print("输入 /exit 退出，/new 开启新会话，/status 查看当前会话。")
+    print("输入 /exit 退出，/new 开启新 Thread，/status 查看当前 Thread。")
     try:
         while True:
             try:
@@ -188,15 +227,26 @@ async def _interactive(args: argparse.Namespace) -> int:
             if task in {"/exit", "/quit"}:
                 break
             if task == "/status":
-                print(f"Session: {session.session_id}")
+                print(f"Thread: {session.session_id}")
                 print(f"Turns: {session.state.turn_count if session.state else 0}")
-                print(f"Trace: {session.session_dir / 'events.jsonl'}")
+                print(f"Rollout: {session.rollout_path}")
+                continue
+            if task.startswith("/permissions"):
+                _permissions_command(config, task)
+                continue
+            if task == "/sandbox":
+                _print_sandbox(config)
+                continue
+            if task == "/approvals":
+                print("审批策略：" + config.security.approval_policy.value + "；临时授权只保存在当前运行进程内。")
+                continue
+            if _phase4_command(task, session):
                 continue
             if task == "/new":
-                session.close()
-                session = ConversationSession(config=config, manager=manager, workspace=Path.cwd())
-                session.start()
-                print(f"New Session ID: {session.session_id}")
+                await session.close()
+                session = ConversationSession(config=config, manager=manager, workspace=Path.cwd(), project_trusted=_resolve_workspace_trust(Path.cwd(), config))
+                await session.start()
+                print(f"New Thread ID: {session.session_id}")
                 continue
             state = await session.run_turn(task)
             if state.final_output:
@@ -207,7 +257,71 @@ async def _interactive(args: argparse.Namespace) -> int:
         print("\n已退出。")
         return 130
     finally:
-        session.close()
+        await session.close()
+        await provider.close()
+    return 0
+
+
+async def _resume(args: argparse.Namespace) -> int:
+    """Resume an existing thread and continue the interactive CLI."""
+    config = load_config(Path(args.config) if getattr(args, "config", None) else None)
+    _apply_common_run_args(config, args)
+    if not _ensure_configured(config):
+        print("还没有配置 API Key。请先运行：agent-harness setup")
+        return 2
+    thread_id = args.thread_id
+    if not thread_id:
+        rows = await LocalThreadStore(config.trace.thread_directory).list_threads()
+        thread_id = rows[0]["thread_id"] if rows else None
+    if not thread_id:
+        print("没有可恢复的 Thread。请先运行：agent-harness code")
+        return 1
+    provider = _resolve_provider(config)
+    manager = RunManager(config=config, provider=provider, approval_handler=ConsoleApprovalHandler())
+    session = ConversationSession(config=config, manager=manager, workspace=Path.cwd(), project_trusted=_resolve_workspace_trust(Path.cwd(), config))
+    try:
+        await session.resume(thread_id)
+        print(f"Thread ID: {session.session_id}")
+        print(f"Workspace: {session.state.workspace_root if session.state else Path.cwd()}")
+        print("输入 /exit 退出，/new 开启新 Thread，/status 查看当前 Thread。")
+        while True:
+            try:
+                task = input("\n> ").strip()
+            except EOFError:
+                break
+            if not task:
+                continue
+            if task in {"/exit", "/quit"}:
+                break
+            if task == "/status":
+                print(f"Thread: {session.session_id}")
+                print(f"Turns: {session.state.turn_count if session.state else 0}")
+                print(f"Rollout: {session.rollout_path}")
+                continue
+            if task.startswith("/permissions"):
+                _permissions_command(config, task)
+                continue
+            if task == "/sandbox":
+                _print_sandbox(config)
+                continue
+            if task == "/approvals":
+                print("审批策略：" + config.security.approval_policy.value + "；临时授权只保存在当前运行进程内。")
+                continue
+            if _phase4_command(task, session):
+                continue
+            if task == "/new":
+                await session.close()
+                session = ConversationSession(config=config, manager=manager, workspace=Path.cwd(), project_trusted=_resolve_workspace_trust(Path.cwd(), config))
+                await session.start()
+                print(f"New Thread ID: {session.session_id}")
+                continue
+            state = await session.run_turn(task)
+            if state.final_output:
+                print("\n" + state.final_output)
+            elif state.error:
+                print(f"\n错误：{state.error.message}")
+    finally:
+        await session.close()
         await provider.close()
     return 0
 
@@ -221,35 +335,255 @@ def _tools(args: argparse.Namespace) -> int:
     return 0
 
 
+def _permissions_command(config, command: str) -> None:
+    """Show or switch the current user-controlled security preset."""
+    parts = command.split(maxsplit=1)
+    if len(parts) == 1:
+        print(f"Sandbox Mode: {config.security.sandbox_mode.value}")
+        print(f"Approval Policy: {config.security.approval_policy.value}")
+        print("可用：/permissions plan|auto|manual|full-access")
+        return
+    preset = parts[1].strip().lower()
+    profiles = {
+        "plan": (SandboxMode.READ_ONLY, ApprovalPolicy.ON_REQUEST),
+        "auto": (SandboxMode.WORKSPACE_WRITE, ApprovalPolicy.ON_REQUEST),
+        "manual": (SandboxMode.WORKSPACE_WRITE, ApprovalPolicy.UNTRUSTED),
+    }
+    if preset == "full-access":
+        confirmation = input("Full Access 将关闭 OS 沙箱。请输入 FULL ACCESS 确认：").strip()
+        if confirmation != "FULL ACCESS":
+            print("未切换。")
+            return
+        config.security.sandbox_mode = SandboxMode.DANGER_FULL_ACCESS
+        config.security.approval_policy = ApprovalPolicy.NEVER
+        config.security.full_access_confirmed = True
+        print("已切换到 danger-full-access。")
+        return
+    if preset not in profiles:
+        print("未知权限预设。")
+        return
+    config.security.sandbox_mode, config.security.approval_policy = profiles[preset]
+    config.security.full_access_confirmed = False
+    print(f"已切换：{preset}")
+
+
+def _print_sandbox(config) -> None:
+    """Print effective sandbox settings without exposing environment secrets."""
+    security = config.security
+    print(f"Backend: {security.sandbox_backend}")
+    print(f"Mode: {security.sandbox_mode.value}")
+    print(f"Network: {'enabled' if security.network_enabled else 'off'}")
+    print(f"Fail Closed: {security.sandbox_required}")
+    print(f"WSL Distribution: {security.wsl_distribution or 'default'}")
+
+
+def _resolve_workspace_trust(workspace: Path, config) -> bool:
+    """Prompt once for repository-provided Guidance and Skills before model injection."""
+    if config.security.trusted_project or (not config.guidance.require_workspace_trust and not config.skills.require_workspace_trust):
+        return True
+    has_project_config = any(
+        path.exists()
+        for path in (workspace / "AGENTS.md", workspace / "AGENTS.override.md", workspace / "CLAUDE.md", workspace / ".agents")
+    )
+    if not has_project_config:
+        return False
+    store = WorkspaceTrustStore(default_user_config_path().parent / "workspace-trust.json")
+    state = store.get(workspace)
+    if state in {WorkspaceTrustState.TRUSTED, WorkspaceTrustState.TRUSTED_ONCE}:
+        return True
+    if state == WorkspaceTrustState.UNTRUSTED:
+        return False
+    print("检测到项目提供的 AGENTS.md、Rules 或 Skills。是否信任这些 Agent 配置？")
+    print("1. 仅本次信任  2. 始终信任此 Workspace  3. 不信任")
+    choice = input("请选择 1/2/3，默认 3：").strip()
+    selected = WorkspaceTrustState.TRUSTED_ONCE if choice == "1" else WorkspaceTrustState.TRUSTED if choice == "2" else WorkspaceTrustState.UNTRUSTED
+    store.set(workspace, selected)
+    return selected in {WorkspaceTrustState.TRUSTED, WorkspaceTrustState.TRUSTED_ONCE}
+
+
+def _phase4_command(command: str, session: ConversationSession) -> bool:
+    """Handle Guidance, Skills, and Trust inspection commands in an idle CLI thread."""
+    if command == "/trust":
+        print("Workspace Trust：" + ("trusted" if session.project_trusted else "untrusted"))
+        return True
+    if command.startswith("/guidance"):
+        snapshot = session.manager.guidance_snapshot
+        if command == "/guidance reload":
+            assert session.thread_id is not None
+            session.manager.initialize_project_context(session.thread_id, session.workspace, project_trusted=session.project_trusted, resume=True)
+            snapshot = session.manager.guidance_snapshot
+            print("Guidance 已重新加载。")
+        if snapshot is None:
+            print("Guidance 未启用。")
+            return True
+        inspect_id = command.removeprefix("/guidance inspect ").strip() if command.startswith("/guidance inspect ") else None
+        if inspect_id:
+            document = next((item for item in (*snapshot.documents, *snapshot.path_rules) if item.document_id == inspect_id), None)
+            print(document.content if document else "未找到 Guidance Document。")
+            return True
+        print(f"Snapshot: {snapshot.snapshot_id} bytes={snapshot.total_bytes} truncated={snapshot.truncated}")
+        for document in (*snapshot.documents, *snapshot.path_rules):
+            print(f"{document.document_id}  {document.source_kind.value}  trusted={document.trusted}  {document.path}")
+        for diagnostic in snapshot.diagnostics:
+            print(f"{diagnostic.level}: {diagnostic.code}: {diagnostic.message}")
+        return True
+    if command.startswith("/skills"):
+        manager = session.manager.skill_manager
+        catalog = session.manager.skill_catalog
+        if command == "/skills reload":
+            assert session.thread_id is not None
+            session.manager.initialize_project_context(session.thread_id, session.workspace, project_trusted=session.project_trusted, resume=True)
+            manager = session.manager.skill_manager
+            catalog = session.manager.skill_catalog
+            print("Skill Catalog 已重新加载；已有 Activation Snapshot 保持不变。")
+        if manager is None or catalog is None:
+            print("Skills 未启用。")
+            return True
+        if command == "/skills active":
+            for activation in manager.active:
+                print(f"{activation.qualified_name}  {activation.activation_id}  turn={activation.activated_turn_id}")
+            return True
+        inspect_name = command.removeprefix("/skills inspect ").strip() if command.startswith("/skills inspect ") else None
+        if inspect_name:
+            try:
+                record = manager.resolve(inspect_name, user_invocation=True)
+                print(record.skill_path.read_text(encoding="utf-8"))
+            except (ValueError, PermissionError, OSError) as exc:
+                print(f"错误：{exc}")
+            return True
+        for record in manager.records:
+            print(f"{record.qualified_name}  scope={record.scope.value} trusted={record.trusted} context={record.context_mode}\n  {record.description}")
+        return True
+    return False
+
+
 def _sessions(args: argparse.Namespace) -> int:
-    """List saved interactive sessions under the current workspace."""
-    root = Path(args.session_dir)
+    """List saved interactive threads; kept as a hidden compatibility alias."""
+    args.thread_dir = args.session_dir
+    return _threads(args)
+
+
+def _threads(args: argparse.Namespace) -> int:
+    """List saved interactive threads under the current workspace."""
+    root = Path(args.thread_dir)
     if not root.exists():
-        print(f"没有找到 session 目录：{root}")
+        print(f"没有找到 thread 目录：{root}")
         return 0
-    sessions = sorted(root.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True)
-    if not sessions:
-        print(f"没有保存的 session：{root}")
+    rows = []
+    for thread_dir in root.iterdir():
+        meta_path = thread_dir / "metadata.json"
+        if not meta_path.exists():
+            continue
+        rows.append(json.loads(meta_path.read_text(encoding="utf-8")))
+    if not rows:
+        print(f"没有保存的 thread：{root}")
         return 0
-    for session_dir in sessions:
-        meta_path = session_dir / "session.json"
-        if meta_path.exists():
-            data = json.loads(meta_path.read_text(encoding="utf-8"))
-            print(f"{data.get('session_id')}  turns={data.get('turn_count')}  status={data.get('status')}  updated={data.get('updated_at')}")
-        else:
-            print(session_dir.name)
+    rows.sort(key=lambda data: data.get("updated_at") or "", reverse=True)
+    for data in rows:
+        print(f"{data.get('thread_id')}  turns={data.get('turn_count')}  status={data.get('status')}  updated={data.get('updated_at')}")
     return 0
 
 
 def _inspect(args: argparse.Namespace) -> int:
-    """Print a saved result.json for an existing task or session id."""
-    base = Path(".harness/sessions") if args.session else Path(args.trace_dir)
-    path = base / args.id / "result.json"
+    """Print a saved result or thread metadata/rollout preview."""
+    if args.thread or args.session:
+        base = Path(".harness/threads")
+        thread_dir = base / args.id
+        meta_path = thread_dir / "metadata.json"
+        rollout_path = thread_dir / "rollout.jsonl"
+        if not meta_path.exists():
+            print(f"Thread not found: {thread_dir}")
+            return 1
+        print(meta_path.read_text(encoding="utf-8"))
+        if rollout_path.exists():
+            lines = [line for line in rollout_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            print(f"\nrollout_items={len(lines)}")
+        return 0
+    path = Path(args.trace_dir) / args.id / "result.json"
     if not path.exists():
         print(f"Result not found: {path}")
         return 1
     print(path.read_text(encoding="utf-8"))
     return 0
+
+
+def _migrate_sessions(args: argparse.Namespace) -> int:
+    """Migrate legacy session transcripts into append-only thread rollout files."""
+    session_root = Path(args.session_dir)
+    thread_root = Path(args.thread_dir)
+    if not session_root.exists():
+        print(f"没有找到旧 session 目录：{session_root}")
+        return 0
+    migrated = 0
+    skipped = 0
+    for session_dir in session_root.iterdir():
+        session_json = session_dir / "session.json"
+        transcript = session_dir / "transcript.jsonl"
+        if not session_json.exists():
+            skipped += 1
+            continue
+        metadata = json.loads(session_json.read_text(encoding="utf-8"))
+        thread_id = str(metadata.get("session_id") or session_dir.name)
+        target = thread_root / thread_id
+        if (target / "metadata.json").exists():
+            skipped += 1
+            continue
+        try:
+            _migrate_one_session(metadata, transcript, target)
+            migrated += 1
+        except Exception as exc:
+            skipped += 1
+            print(f"迁移失败 {session_dir.name}: {exc}")
+    print(f"迁移完成：migrated={migrated} skipped={skipped}")
+    return 0
+
+
+def _migrate_one_session(metadata: dict, transcript: Path, target: Path) -> None:
+    """Convert one legacy session directory into thread metadata and rollout history."""
+    thread_id = str(metadata.get("session_id") or target.name)
+    target.mkdir(parents=True, exist_ok=True)
+    thread_metadata = {
+        "thread_id": thread_id,
+        "session_id": thread_id,
+        "parent_thread_id": None,
+        "forked_from_id": None,
+        "workspace_root": metadata.get("workspace_root"),
+        "name": None,
+        "preview": None,
+        "status": "CLOSED",
+        "model_provider": None,
+        "model": None,
+        "created_at": metadata.get("updated_at"),
+        "updated_at": metadata.get("updated_at"),
+        "last_turn_id": None,
+        "turn_count": metadata.get("turn_count", 0),
+        "archived": False,
+        "child_thread_ids": [],
+    }
+    (target / "metadata.json").write_text(json.dumps(thread_metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    items = [
+        RolloutItem.create(
+            "thread.created",
+            session_id=thread_id,
+            thread_id=thread_id,
+            payload={"workspace_root": metadata.get("workspace_root"), "migrated_from": "legacy_session"},
+        )
+    ]
+    if transcript.exists():
+        for line in transcript.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            role_type = str(record.get("type") or "")
+            turn_id = record.get("turn_id")
+            if role_type == "user":
+                items.append(RolloutItem.create("user_message", session_id=thread_id, thread_id=thread_id, turn_id=turn_id, payload={"text": record.get("content"), "input_kind": "initial"}))
+            if role_type == "assistant":
+                items.append(RolloutItem.create("agent_message", session_id=thread_id, thread_id=thread_id, turn_id=turn_id, payload={"text": record.get("content"), "status": record.get("status"), "error": record.get("error")}))
+                items.append(RolloutItem.create("turn.completed", session_id=thread_id, thread_id=thread_id, turn_id=turn_id, payload={"final_output": record.get("content"), "error": record.get("error")}))
+    with (target / "rollout.jsonl").open("w", encoding="utf-8") as handle:
+        for item in items:
+            handle.write(json.dumps(to_jsonable(item), ensure_ascii=False) + "\n")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -265,19 +599,28 @@ def main(argv: list[str] | None = None) -> int:
         args.config = None
         args.max_iterations = None
         args.trace_dir = None
+        args.sandbox = None
+        args.approval_policy = None
+        args.danger_full_access = False
         return asyncio.run(_interactive(args))
     if args.command == "setup":
         return _setup(args)
     if args.command == "code":
         return asyncio.run(_code(args))
+    if args.command == "resume":
+        return asyncio.run(_resume(args))
     if args.command in {"exec", "run"}:
         return asyncio.run(_run(args))
     if args.command == "tools":
         return _tools(args)
+    if args.command == "threads":
+        return _threads(args)
     if args.command == "sessions":
         return _sessions(args)
     if args.command == "inspect":
         return _inspect(args)
+    if args.command == "migrate-sessions":
+        return _migrate_sessions(args)
     parser.print_help()
     return 2
 
