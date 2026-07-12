@@ -56,9 +56,10 @@ async def test_real_stdio_sdk_lifecycle_tools_resources_and_prompts(tmp_path: Pa
         assert runtime.manager.connections["fixture"].status == MCPServerStatus.READY
         registry = ToolRegistry()
         names = runtime.register_tools(registry)
-        assert "mcp__fixture__echo_chinese" in names
-        result = await registry.get("mcp__fixture__echo_chinese").executor({"text": "真实调用"})
-        assert result == {"echo": "真实调用"}
+        echo_name = next(item.canonical_name for item in runtime.tools() if item.remote_name == "echo_chinese")
+        assert echo_name in names
+        result = await registry.get(echo_name).executor({"text": "真实调用"})
+        assert result["structured_content"] == {"echo": "真实调用"}
         resource = await runtime.manager.active_servers["fixture"].read_resource("memo://acceptance")
         assert "真实 MCP 资源读取成功" in str(resource)
         prompt = await runtime.manager.active_servers["fixture"].get_prompt("chinese_review", {"topic": "权限边界"})

@@ -23,6 +23,7 @@ class ToolDefinition:
     side_effect: SideEffectType = SideEffectType.NONE
     required_capabilities: frozenset[Capability] = field(default_factory=lambda: frozenset({Capability.FILE_READ}))
     requires_sandbox: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Normalize legacy string metadata into the phase 3 security enums."""

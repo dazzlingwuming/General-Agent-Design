@@ -132,6 +132,7 @@ class RunManager:
             provider=self.provider,
             trace=trace,
             agent_registry=agent_registry,
+            mcp_runtime=self.mcp_runtime,
             max_concurrent=self.config.subagents.max_concurrent,
             max_total=self.config.subagents.max_total,
             max_depth=self.config.subagents.max_depth,
@@ -150,7 +151,7 @@ class RunManager:
             registry.register(create_read_skill_resource_tool(self.skill_manager, self.config.skills.max_resource_bytes, self._rollout_event))
         register_subagent_control_tools(registry, scheduler, self.config.tools.default_timeout_seconds)
         if self.mcp_runtime:
-            mcp_names = self.mcp_runtime.register_tools(registry, eager=self.config.mcp.tool_disclosure == "eager")
+            mcp_names = self.mcp_runtime.register_tools(registry, eager=self.config.mcp.tool_disclosure == "eager", turn_id_provider=lambda: state.turn_id or "turn_unknown")
         else:
             mcp_names = []
         agent_registry.validate(registry.names() | {"submit_result"})
@@ -222,6 +223,8 @@ class RunManager:
             return await loop.run(state)
         finally:
             self.skill_executions.finish_turn(state.turn_id or "turn_unknown")
+            if self.mcp_runtime:
+                self.mcp_runtime.finish_turn(state.turn_id or "turn_unknown")
             if scheduler.active_agent_ids():
                 await scheduler.cancel_all()
             state.agent_summary = scheduler.summary()
@@ -346,7 +349,7 @@ class RunManager:
                 additionally_blocked.append(item)
                 self._rollout_event("mcp.server_blocked", {"server": item.name, "reason": "project_stdio_first_launch_not_approved"})
         resolved = type(resolved)(tuple(allowed), tuple(additionally_blocked), resolved.diagnostics)
-        self.mcp_runtime = MCPRuntime(resolved, (self.project_paths.workspace_root,), self._rollout_event)
+        self.mcp_runtime = MCPRuntime(resolved, (self.project_paths.workspace_root,), self._rollout_event, connect_in_parallel=self.config.mcp.connect_in_parallel, max_parallel_connections=self.config.mcp.max_parallel_connections, disclosure_mode=self.config.mcp.tool_disclosure, max_estimated_input_tokens=self.config.context.max_estimated_input_tokens, char_to_token_ratio=self.config.context.char_to_token_ratio)
         await self.mcp_runtime.start()
         if self.current_thread_id:
             thread_snapshot_dir = self.config.trace.thread_directory / self.current_thread_id / "snapshots"
@@ -391,7 +394,7 @@ class RunManager:
     def _effective_tools(self, turn_id: str, agent_tools: list[str]) -> list[str]:
         """Apply Skill restrictions and MCP progressive schema disclosure together."""
         names = self._effective_skill_tools(turn_id, agent_tools)
-        return self.mcp_runtime.effective_tool_names(names) if self.mcp_runtime else names
+        return self.mcp_runtime.effective_tool_names(turn_id, names) if self.mcp_runtime else names
 
     async def _delegate_fork_skill(self, scheduler: SubagentScheduler, activation: SkillActivationSnapshot) -> dict[str, Any]:
         """Run a fork-context Skill in its declared child agent and return structured output."""

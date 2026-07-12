@@ -12,10 +12,11 @@ from agent_harness.mcp.models import MCPServerConfig, MCPServerStatus
 class MCPServerManager:
     """Connect MCP servers concurrently while isolating optional failures."""
 
-    def __init__(self, configs: tuple[MCPServerConfig, ...], roots: tuple[Path, ...], audit: Callable[[str, dict[str, Any]], None] | None = None, max_parallel: int = 4) -> None:
+    def __init__(self, configs: tuple[MCPServerConfig, ...], roots: tuple[Path, ...], audit: Callable[[str, dict[str, Any]], None] | None = None, max_parallel: int = 4, connect_in_parallel: bool = True) -> None:
         """Create disconnected connection objects and a bounded connect semaphore."""
         self.connections = {config.name: MCPServerConnection(config, roots, audit) for config in configs}
         self.max_parallel = max_parallel
+        self.connect_in_parallel = connect_in_parallel
 
     @property
     def active_servers(self) -> dict[str, MCPServerConnection]:
@@ -40,7 +41,7 @@ class MCPServerManager:
                 except Exception as exc:
                     return exc
 
-        results = await asyncio.gather(*(connect_one(item) for item in self.connections.values()))
+        results = await asyncio.gather(*(connect_one(item) for item in self.connections.values())) if self.connect_in_parallel else [await connect_one(item) for item in self.connections.values()]
         required_errors = [error for error, item in zip(results, self.connections.values()) if error and item.config.required]
         if required_errors:
             await self.shutdown()

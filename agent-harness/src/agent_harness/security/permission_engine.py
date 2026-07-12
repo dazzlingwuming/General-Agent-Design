@@ -30,6 +30,9 @@ class PermissionEngine:
         rule_decision = resolve_rule_decision(matches)
         if rule_decision:
             return PermissionEvaluation(rule_decision, "Matched permission rules", [rule.rule_id for rule in matches], principal.capabilities, sandbox_policy)
+        mcp_decision = self._evaluate_mcp_policy(tool)
+        if mcp_decision is not None:
+            return self._result(mcp_decision, f"MCP approval mode {tool.metadata.get('mcp_approval_mode')}", principal, sandbox_policy)
         default = self._default_decision(principal, tool)
         return self._result(default, "Security profile default", principal, sandbox_policy)
 
@@ -51,6 +54,11 @@ class PermissionEngine:
         if tool.name == "delete_path" or tool.risk_level.value in {"HIGH", "CRITICAL"}:
             return PermissionDecision.ASK
         return PermissionDecision.ALLOW
+
+    def _evaluate_mcp_policy(self, tool: ToolDefinition) -> PermissionDecision | None:
+        """Apply resolved MCP approval metadata without bypassing earlier hard denials."""
+        raw = tool.metadata.get("mcp_approval_decision")
+        return PermissionDecision(str(raw)) if raw in {item.value for item in PermissionDecision} else None
 
     def _result(self, decision: PermissionDecision, reason: str, principal: ToolExecutionPrincipal, policy: SandboxPolicy) -> PermissionEvaluation:
         """Build a permission evaluation with common effective fields."""

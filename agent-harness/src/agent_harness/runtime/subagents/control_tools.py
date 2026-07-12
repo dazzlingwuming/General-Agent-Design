@@ -31,6 +31,7 @@ def _spawn_tool(scheduler: SubagentScheduler, timeout_seconds: int) -> ToolDefin
                 context=args.get("context", ""),
                 expected_focus=args.get("expected_focus", ""),
                 idempotency_key=args.get("idempotency_key"),
+                allowed_mcp_tools=tuple(map(str, args.get("allowed_mcp_tools", []))),
             )
         )
 
@@ -45,6 +46,7 @@ def _spawn_tool(scheduler: SubagentScheduler, timeout_seconds: int) -> ToolDefin
                 "context": {"type": "string"},
                 "expected_focus": {"type": "string"},
                 "idempotency_key": {"type": "string"},
+                "allowed_mcp_tools": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["agent_name", "task"],
             "additionalProperties": False,

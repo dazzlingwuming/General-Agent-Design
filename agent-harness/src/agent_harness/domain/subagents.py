@@ -113,3 +113,4 @@ class DelegationRequest:
     expected_focus: str = ""
     idempotency_key: str | None = None
     allowed_tools: tuple[str, ...] = ()
+    allowed_mcp_tools: tuple[str, ...] = ()

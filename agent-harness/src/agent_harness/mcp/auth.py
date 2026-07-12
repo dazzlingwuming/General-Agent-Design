@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import webbrowser
-from urllib.parse import parse_qs, urlparse
+import hashlib
+from dataclasses import dataclass
+from urllib.parse import parse_qs, urlparse, urlunparse
 
 import keyring
 from mcp.client.auth import OAuthClientProvider, TokenStorage
@@ -12,12 +14,42 @@ from pydantic import AnyUrl
 from agent_harness.mcp.models import MCPServerConfig
 
 
+@dataclass(frozen=True, slots=True)
+class MCPCredentialIdentity:
+    """Bind stored OAuth material to one exact resource-server identity."""
+
+    server_name: str
+    canonical_resource_uri: str
+    auth_mode: str
+    scopes: tuple[str, ...]
+
+    @property
+    def digest(self) -> str:
+        """Return the stable non-secret identity digest used by the credential service."""
+        value = "\0".join((self.server_name, self.canonical_resource_uri, self.auth_mode, *self.scopes))
+        return hashlib.sha256(value.encode()).hexdigest()
+
+
+def credential_identity(config: MCPServerConfig) -> MCPCredentialIdentity:
+    """Canonicalize URL and scopes so configuration changes require fresh authorization."""
+    if not config.url:
+        raise ValueError("OAuth credential identity requires an HTTP URL")
+    parsed = urlparse(config.url)
+    host = (parsed.hostname or "").lower()
+    default_port = (parsed.scheme.lower() == "https" and parsed.port == 443) or (parsed.scheme.lower() == "http" and parsed.port == 80)
+    netloc = host if default_port or parsed.port is None else f"{host}:{parsed.port}"
+    path = "/" + "/".join(part for part in parsed.path.split("/") if part)
+    uri = urlunparse((parsed.scheme.lower(), netloc, path or "/", "", parsed.query, ""))
+    return MCPCredentialIdentity(config.name, uri, config.auth_mode, tuple(sorted(set(config.oauth_scopes))))
+
+
 class KeyringTokenStorage(TokenStorage):
     """Store MCP OAuth tokens in the operating-system credential backend."""
 
-    def __init__(self, server_name: str) -> None:
-        """Namespace credentials by MCP server without exposing values in config files."""
-        self.service = f"agent-harness-mcp:{server_name}"
+    def __init__(self, identity: MCPCredentialIdentity | str) -> None:
+        """Namespace credentials by resource identity without exposing values in config files."""
+        digest = identity.digest if isinstance(identity, MCPCredentialIdentity) else hashlib.sha256(identity.encode()).hexdigest()
+        self.service = f"agent-harness-mcp:{digest[:24]}"
 
     async def get_tokens(self) -> OAuthToken | None:
         """Read and validate an OAuth token record from the OS credential store."""
@@ -62,7 +94,7 @@ def create_oauth_provider(config: MCPServerConfig) -> OAuthClientProvider:
     return OAuthClientProvider(
         config.url,
         metadata,
-        KeyringTokenStorage(config.name),
+        KeyringTokenStorage(credential_identity(config)),
         redirect_handler=_open_authorization_url,
         callback_handler=_read_authorization_callback,
         timeout=300,

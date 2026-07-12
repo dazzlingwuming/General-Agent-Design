@@ -45,7 +45,8 @@ async def test_real_streamable_http_sdk_lifecycle(tmp_path: Path) -> None:
         try:
             connection = runtime.manager.connections["http_fixture"]
             assert connection.status == MCPServerStatus.READY
-            assert await connection.call_tool("echo_chinese", {"text": "HTTP 真实调用"}) == {"echo": "HTTP 真实调用"}
+            result = await connection.call_tool("echo_chinese", {"text": "HTTP 真实调用"})
+            assert result["structured_content"] == {"echo": "HTTP 真实调用"}
         finally:
             await runtime.close()
     finally:

@@ -117,3 +117,10 @@ class MCPServerSnapshot:
     instructions: str | None = None
     capabilities: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
+    catalog_page_count: int = 0
+    catalog_truncated: bool = False
+    catalog_hash: str = ""
+    instructions_hash: str = ""
+    instructions_chars: int = 0
+    credential_identity_hash: str | None = None
+    canonical_tool_mapping: tuple[dict[str, str], ...] = ()

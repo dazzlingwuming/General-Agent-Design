@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -20,6 +21,18 @@ class MCPResolvedConfig:
     servers: tuple[MCPServerConfig, ...]
     blocked: tuple[MCPServerConfig, ...] = ()
     diagnostics: tuple[str, ...] = ()
+    admin_policy: "MCPAdminPolicy" = field(default_factory=lambda: MCPAdminPolicy())
+
+
+@dataclass(frozen=True, slots=True)
+class MCPAdminPolicy:
+    """Minimal fail-closed enterprise policy that lower scopes cannot override."""
+
+    disabled_servers: tuple[str, ...] = ()
+    allowed_stdio_commands: tuple[str, ...] = ()
+    allowed_http_domains: tuple[str, ...] = ()
+    denied_http_domains: tuple[str, ...] = ()
+    denied_tools: tuple[str, ...] = ()
 
 
 class MCPConfigResolver:
@@ -42,8 +55,11 @@ class MCPConfigResolver:
         winners: dict[str, MCPServerConfig] = {}
         blocked: list[MCPServerConfig] = []
         diagnostics: list[str] = []
+        admin_policy, admin_rows = self._read_admin_config(diagnostics)
+        self._parse_rows(admin_rows, MCPConfigScope.ADMIN, winners, blocked, diagnostics)
+        admin_names = set(winners)
         if inline_user_servers:
-            self._parse_rows(inline_user_servers, MCPConfigScope.USER, winners, blocked, diagnostics)
+            self._parse_rows(inline_user_servers, MCPConfigScope.USER, winners, blocked, diagnostics, protected_names=admin_names)
         for scope, path in sources:
             if not path.is_file():
                 continue
@@ -52,14 +68,25 @@ class MCPConfigResolver:
                 rows = raw.get("mcpServers", raw.get("servers", {})) if isinstance(raw, dict) else {}
                 if not isinstance(rows, dict):
                     raise MCPConfigurationError("server map must be an object")
-                self._parse_rows(rows, scope, winners, blocked, diagnostics)
+                self._parse_rows(rows, scope, winners, blocked, diagnostics, protected_names=admin_names)
             except (OSError, json.JSONDecodeError, MCPConfigurationError) as exc:
                 diagnostics.append(f"{path}: {exc}")
-        return MCPResolvedConfig(tuple(sorted(winners.values(), key=lambda item: item.name)), tuple(blocked), tuple(diagnostics))
+        allowed: list[MCPServerConfig] = []
+        for config in winners.values():
+            reason = self._admin_denial(config, admin_policy)
+            if reason:
+                blocked.append(config)
+                diagnostics.append(f"admin:{config.name}: {reason}")
+                continue
+            allowed.append(replace(config, disabled_tools=tuple(sorted(set(config.disabled_tools) | set(admin_policy.denied_tools)))))
+        return MCPResolvedConfig(tuple(sorted(allowed, key=lambda item: item.name)), tuple(blocked), tuple(diagnostics), admin_policy)
 
-    def _parse_rows(self, rows: dict[str, Any], scope: MCPConfigScope, winners: dict[str, MCPServerConfig], blocked: list[MCPServerConfig], diagnostics: list[str]) -> None:
+    def _parse_rows(self, rows: dict[str, Any], scope: MCPConfigScope, winners: dict[str, MCPServerConfig], blocked: list[MCPServerConfig], diagnostics: list[str], *, protected_names: set[str] | None = None) -> None:
         """Parse one scope and replace lower-priority complete entries by name."""
         for name, row in rows.items():
+            if protected_names and str(name) in protected_names and scope != MCPConfigScope.ADMIN:
+                diagnostics.append(f"{scope.value}:{name}: ignored because Admin defines this server")
+                continue
             try:
                 config = parse_server_config(str(name), row, scope, self.project_root)
                 if scope == MCPConfigScope.PROJECT and not self.trust.mcp_allowed:
@@ -69,6 +96,37 @@ class MCPConfigResolver:
                 winners[config.name] = config
             except (TypeError, ValueError, MCPConfigurationError) as exc:
                 diagnostics.append(f"{scope.value}:{name}: {exc}")
+
+    def _read_admin_config(self, diagnostics: list[str]) -> tuple[MCPAdminPolicy, dict[str, Any]]:
+        """Read one machine-managed policy and server map without accepting lower overrides."""
+        path = self.admin_root / "mcp.json"
+        if not path.is_file():
+            return MCPAdminPolicy(), {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise MCPConfigurationError("admin config must be an object")
+            policy = raw.get("policy", {})
+            if not isinstance(policy, dict):
+                raise MCPConfigurationError("admin policy must be an object")
+            return MCPAdminPolicy(tuple(map(str, policy.get("disabledServers", []))), tuple(map(str, policy.get("allowedStdioCommands", []))), tuple(map(str, policy.get("allowedHttpDomains", []))), tuple(map(str, policy.get("deniedHttpDomains", []))), tuple(map(str, policy.get("deniedTools", [])))), dict(raw.get("mcpServers", {}))
+        except (OSError, json.JSONDecodeError, MCPConfigurationError) as exc:
+            diagnostics.append(f"{path}: {exc}")
+            return MCPAdminPolicy(), {}
+
+    def _admin_denial(self, config: MCPServerConfig, policy: MCPAdminPolicy) -> str | None:
+        """Return the first machine-policy denial for a resolved server."""
+        if config.name in policy.disabled_servers:
+            return "server is disabled"
+        if config.transport == MCPTransport.STDIO and policy.allowed_stdio_commands and not any(fnmatch(config.command or "", pattern) for pattern in policy.allowed_stdio_commands):
+            return "stdio command is not allowed"
+        if config.url:
+            host = (urlparse(config.url).hostname or "").lower()
+            if any(fnmatch(host, pattern.lower()) for pattern in policy.denied_http_domains):
+                return "HTTP domain is denied"
+            if policy.allowed_http_domains and not any(fnmatch(host, pattern.lower()) for pattern in policy.allowed_http_domains):
+                return "HTTP domain is not allowed"
+        return None
 
 
 def parse_server_config(name: str, row: Any, scope: MCPConfigScope, project_root: Path) -> MCPServerConfig:

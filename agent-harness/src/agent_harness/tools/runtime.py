@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -72,8 +73,13 @@ class ToolRuntime:
             content = self._format_output(output)
             metadata: dict[str, Any] = {"output": output}
             if len(content) > self.max_result_chars:
-                content = content[: self.max_result_chars] + "\n[truncated]"
-                metadata["truncated"] = True
+                if definition.metadata.get("mcp_server"):
+                    artifact = self._write_mcp_artifact(principal, call.name, content)
+                    content = content[: min(2000, self.max_result_chars)] + f"\n[完整结果已保存为 Artifact: {artifact['artifact_id']}]"
+                    metadata.update(artifact)
+                else:
+                    content = content[: self.max_result_chars] + "\n[truncated]"
+                    metadata["truncated"] = True
             return self._result(call, "success", content, started, metadata=metadata)
         except asyncio.TimeoutError:
             self._emit("sandbox.failed", {"tool": call.name, "tool_call_id": call.id, "reason": "timeout"})
@@ -224,6 +230,18 @@ class ToolRuntime:
         if isinstance(output, str):
             return output
         return json.dumps(output, ensure_ascii=False, indent=2)
+
+    def _write_mcp_artifact(self, principal: ToolExecutionPrincipal, tool_name: str, content: str) -> dict[str, Any]:
+        """Persist an oversized MCP result under the owning thread with a host-generated name."""
+        encoded = content.encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        artifact_id = f"mcp_{digest[:16]}"
+        directory = self.workspace_root / ".harness" / "threads" / principal.thread_id / "artifacts" / "mcp"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{artifact_id}.json"
+        path.write_bytes(encoded)
+        self._emit("mcp.artifact_created", {"artifact_id": artifact_id, "tool": tool_name, "size": len(encoded), "sha256": digest})
+        return {"artifact_id": artifact_id, "artifact_path": str(path), "original_size": len(encoded), "mime_type": "application/json", "sha256": digest, "truncated": False}
 
     def _result(
         self,

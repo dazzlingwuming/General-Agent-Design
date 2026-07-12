@@ -197,6 +197,8 @@ class AgentLoop:
             )
         if self.agent.can_spawn_subagents:
             capabilities.add(Capability.SUBAGENT_CREATE)
+        if any(name.startswith("mcp__") for name in self.agent.enabled_tools):
+            capabilities.update({Capability.MCP_TOOL_CALL, Capability.NETWORK_ACCESS, Capability.EXTERNAL_SIDE_EFFECT})
         return ToolExecutionPrincipal(
             session_id=state.run_id,
             thread_id=state.run_id,

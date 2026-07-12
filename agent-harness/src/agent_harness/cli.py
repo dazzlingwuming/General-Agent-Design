@@ -20,7 +20,7 @@ from agent_harness.security.approval import ConsoleApprovalHandler
 from agent_harness.security.models import ApprovalPolicy, SandboxMode
 from agent_harness.utils.serialization import to_jsonable
 from agent_harness.guidance.trust import WorkspaceTrustState, WorkspaceTrustStore
-from agent_harness.mcp.auth import KeyringTokenStorage
+from agent_harness.mcp.auth import KeyringTokenStorage, credential_identity
 from agent_harness.utils.atomic_files import atomic_write_json
 from agent_harness.mcp.config import parse_server_config
 from agent_harness.mcp.models import MCPConfigScope
@@ -263,7 +263,7 @@ async def _interactive(args: argparse.Namespace) -> int:
             if task == "/approvals":
                 print("审批策略：" + config.security.approval_policy.value + "；临时授权只保存在当前运行进程内。")
                 continue
-            if _phase4_command(task, session):
+            if await _phase4_command(task, session):
                 continue
             if task == "/new":
                 await session.close()
@@ -330,7 +330,7 @@ async def _resume(args: argparse.Namespace) -> int:
             if task == "/approvals":
                 print("审批策略：" + config.security.approval_policy.value + "；临时授权只保存在当前运行进程内。")
                 continue
-            if _phase4_command(task, session):
+            if await _phase4_command(task, session):
                 continue
             if task == "/new":
                 await session.close()
@@ -424,13 +424,45 @@ def _resolve_workspace_trust(workspace: Path, config) -> bool:
     return selected in {WorkspaceTrustState.TRUSTED, WorkspaceTrustState.TRUSTED_ONCE}
 
 
-def _phase4_command(command: str, session: ConversationSession) -> bool:
+async def _phase4_command(command: str, session: ConversationSession) -> bool:
     """Handle Guidance, Skills, and Trust inspection commands in an idle CLI thread."""
-    if command == "/mcp":
+    if command.startswith("/mcp"):
         runtime = session.manager.mcp_runtime
         if not runtime:
             print("当前 Thread 未启用 MCP Runtime。")
             return True
+        if command.startswith("/mcp resources"):
+            server = command.removeprefix("/mcp resources").strip() or None
+            for resource in runtime.resources():
+                if server is None or resource.server_name == server:
+                    print(f"{resource.server_name}\t{resource.uri}\t{resource.name}\t{resource.mime_type or ''}")
+            return True
+        if command.startswith("/mcp resource "):
+            parts = command.removeprefix("/mcp resource ").split(maxsplit=1)
+            if len(parts) != 2 or parts[0] not in runtime.manager.active_servers:
+                print("用法：/mcp resource <server> <uri>")
+                return True
+            payload = await runtime.manager.active_servers[parts[0]].read_resource(parts[1])
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return True
+        if command.startswith("/mcp prompts"):
+            server = command.removeprefix("/mcp prompts").strip() or None
+            for prompt in runtime.prompts():
+                if server is None or prompt.server_name == server:
+                    print(f"{prompt.server_name}/{prompt.name}\t{prompt.description}")
+            return True
+        if command.startswith("/mcp prompt "):
+            parts = command.removeprefix("/mcp prompt ").split()
+            target = parts[0].split("/", maxsplit=1) if parts else []
+            if len(target) != 2 or target[0] not in runtime.manager.active_servers:
+                print("用法：/mcp prompt <server>/<name> key=value ...")
+                return True
+            values = dict(item.split("=", maxsplit=1) for item in parts[1:] if "=" in item)
+            payload = await runtime.manager.active_servers[target[0]].get_prompt(target[1], values or None)
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return True
+        if command != "/mcp":
+            return False
         for row in runtime.status_rows():
             print(
                 f"{row['name']}: {row['status']} transport={row['transport']} "
@@ -678,7 +710,12 @@ async def _mcp_command(args: argparse.Namespace) -> int:
         print(f"已移除 MCP Server：{args.name}")
         return 0
     if args.mcp_command == "logout":
-        await KeyringTokenStorage(args.name).clear()
+        found = rows.get(args.name)
+        if found is None:
+            print(f"未找到 MCP Server：{args.name}")
+            return 1
+        config = parse_server_config(args.name, found, MCPConfigScope.USER, Path.cwd())
+        await KeyringTokenStorage(credential_identity(config)).clear()
         print(f"已清除 MCP OAuth 凭据：{args.name}")
         return 0
     if args.mcp_command == "login":

@@ -36,6 +36,7 @@ class SubagentScheduler:
     provider: ModelProvider
     trace: JsonlTraceSink
     agent_registry: AgentRegistry
+    mcp_runtime: Any | None = None
     max_concurrent: int = 3
     max_total: int = 8
     max_depth: int = 1
@@ -233,6 +234,9 @@ class SubagentScheduler:
                     definition.enabled_tools = [name for name in definition.enabled_tools if name in request.allowed_tools or name == "submit_result"]
                 registry = create_default_registry(self.workspace_root, self.config.tools.default_timeout_seconds)
                 registry.register(create_submit_result_tool(self.config.tools.default_timeout_seconds))
+                if self.mcp_runtime and request.allowed_mcp_tools:
+                    delegated = self.mcp_runtime.register_delegated_tools(registry, request.allowed_mcp_tools)
+                    definition.enabled_tools.extend(name for name in delegated if name not in definition.enabled_tools)
                 loop = AgentLoop(
                     agent=definition,
                     provider=self.provider,
