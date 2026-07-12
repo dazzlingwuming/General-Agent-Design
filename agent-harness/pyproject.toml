@@ -37,6 +37,7 @@ markers = [
   "platform_windows: tests requiring Windows or WSL platform capabilities",
   "live_provider: tests that call a real model provider",
   "live_oauth: tests that require a real external OAuth provider",
+  "recovery_process: tests that terminate a child process and verify durable recovery",
 ]
 testpaths = ["tests"]
 norecursedirs = ["tests/fixtures"]

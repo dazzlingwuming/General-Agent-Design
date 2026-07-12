@@ -25,6 +25,30 @@ char_to_token_ratio = 4.0
 max_estimated_input_tokens = 120000
 recent_turns = 3
 
+[persistence]
+enabled = true
+runtime_db = ".harness/runtime.sqlite3"
+auto_recover_safe = true
+checkpoint_retention_per_turn = 20
+fail_on_integrity_error = true
+
+[memory]
+enabled = true
+read_enabled = true
+write_enabled = true
+auto_extract = false
+database = ".harness/memory.sqlite3"
+max_results = 10
+max_context_fraction = 0.05
+
+[compaction]
+enabled = true
+auto_compact = true
+idle_only = true
+estimated_token_threshold = 0.75
+retain_recent_turns = 6
+max_summary_chars = 12000
+
 [trace]
 directory = ".harness/runs"
 thread_directory = ".harness/threads"

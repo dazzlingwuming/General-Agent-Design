@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from agent_harness.domain.errors import ToolInputValidationError
-from agent_harness.domain.tools import ToolDefinition
+from agent_harness.domain.tools import ToolDefinition, ToolEffectClass, ToolRecoveryPolicy
 from agent_harness.sandbox.base import CommandExecution, SandboxBackend
 from agent_harness.security.models import Capability, RiskLevel, SandboxPolicy, SideEffectType
 from agent_harness.security.path_policy import FileSystemPolicy
@@ -52,6 +52,8 @@ def create_run_command_tool(workspace_root: Path, backend: SandboxBackend, sandb
         side_effect=SideEffectType.PROCESS,
         required_capabilities=frozenset({Capability.COMMAND_EXECUTE}),
         requires_sandbox=True,
+        effect_class=ToolEffectClass.NON_IDEMPOTENT_WRITE,
+        recovery_policy=ToolRecoveryPolicy.NEVER_RETRY,
     )
 
 

@@ -143,7 +143,7 @@ async def test_resume_skips_corrupted_rollout_line(tmp_path: Path):
 
 
 async def test_resume_incomplete_turn_uses_one_recorder_and_is_idempotent(tmp_path: Path, monkeypatch):
-    """Append one interrupted terminal item while returning the only created live handle."""
+    """Keep an incomplete durable turn resumable without inventing an interrupted terminal item."""
     store = LocalThreadStore(tmp_path / "threads")
     live = await store.create_thread(tmp_path, provider="fake", model="fake-model")
     turn_id = "turn_0001"
@@ -167,7 +167,8 @@ async def test_resume_incomplete_turn_uses_one_recorder_and_is_idempotent(tmp_pa
     resumed_again = await store.resume_thread(thread_id)
     history = await store.load_history(thread_id)
     assert len(created) == 2
-    assert sum(item.item_type == "turn.interrupted" for item in history) == 1
+    assert sum(item.item_type == "turn.interrupted" for item in history) == 0
+    assert sum(item.item_type == "turn.started" for item in history) == 1
     await resumed_again.shutdown()
 
 

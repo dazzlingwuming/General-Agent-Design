@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from agent_harness.domain.tools import ToolDefinition
+from agent_harness.domain.tools import ToolDefinition, ToolEffectClass, ToolRecoveryPolicy
 from agent_harness.security.models import Capability, RiskLevel, SideEffectType
 from agent_harness.security.path_policy import FileSystemPolicy
 
@@ -37,6 +37,8 @@ def create_write_file_tool(workspace_root: Path, timeout_seconds: int = 30) -> T
         risk_level=RiskLevel.MEDIUM,
         side_effect=SideEffectType.FILESYSTEM,
         required_capabilities=frozenset({Capability.FILE_WRITE}),
+        effect_class=ToolEffectClass.RECONCILABLE_WRITE,
+        recovery_policy=ToolRecoveryPolicy.VERIFY_THEN_SYNTHESIZE,
     )
 
 
@@ -45,4 +47,3 @@ def _write_text(path: Path, content: str, create_parents: bool) -> None:
     if create_parents:
         path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
-

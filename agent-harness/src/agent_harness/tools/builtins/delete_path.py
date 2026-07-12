@@ -4,7 +4,7 @@ import asyncio
 import shutil
 from pathlib import Path
 
-from agent_harness.domain.tools import ToolDefinition
+from agent_harness.domain.tools import ToolDefinition, ToolEffectClass, ToolRecoveryPolicy
 from agent_harness.security.models import Capability, RiskLevel, SideEffectType
 from agent_harness.security.path_policy import FileSystemPolicy
 
@@ -34,6 +34,8 @@ def create_delete_path_tool(workspace_root: Path, timeout_seconds: int = 30) -> 
         risk_level=RiskLevel.HIGH,
         side_effect=SideEffectType.FILESYSTEM,
         required_capabilities=frozenset({Capability.FILE_DELETE}),
+        effect_class=ToolEffectClass.NON_IDEMPOTENT_WRITE,
+        recovery_policy=ToolRecoveryPolicy.MANUAL_RECONCILIATION,
     )
 
 
@@ -45,4 +47,3 @@ def _delete(path: Path, recursive: bool) -> None:
         shutil.rmtree(path)
         return
     path.unlink()
-

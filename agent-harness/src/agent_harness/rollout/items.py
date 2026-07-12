@@ -34,6 +34,10 @@ class RolloutItem:
     created_at: str
     completed_at: str | None
     payload: dict[str, Any] = field(default_factory=dict)
+    schema_version: int = 2
+    sequence_number: int = 0
+    previous_hash: str = ""
+    item_hash: str = ""
 
     @classmethod
     def create(
@@ -84,4 +88,8 @@ def item_from_dict(data: dict[str, Any]) -> RolloutItem:
         created_at=str(data["created_at"]),
         completed_at=data.get("completed_at"),
         payload=dict(data.get("payload") or {}),
+        schema_version=int(data.get("schema_version", 1)),
+        sequence_number=int(data.get("sequence_number", 0)),
+        previous_hash=str(data.get("previous_hash", "")),
+        item_hash=str(data.get("item_hash", "")),
     )

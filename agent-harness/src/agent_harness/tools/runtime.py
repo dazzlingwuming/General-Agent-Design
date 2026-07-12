@@ -12,7 +12,7 @@ from typing import Any, Callable
 from agent_harness.domain.errors import HarnessError, ToolAuthorizationError, ToolInputValidationError, ToolTimeoutError
 from agent_harness.domain.messages import ToolCall
 from agent_harness.domain.tools import ToolDefinition, ToolResult
-from agent_harness.security.approval import ApprovalDecision, ApprovalHandler, ApprovalRequest, DenyApprovalHandler, TurnCancellationRequested, redact_approval_arguments
+from agent_harness.security.approval import ApprovalDecision, ApprovalHandler, ApprovalRequest, DenyApprovalHandler, TurnCancellationRequested, redact_approval_arguments, stable_approval_id
 from agent_harness.security.approval_grants import ApprovalGrantStore
 from agent_harness.security.hooks import HookDecision, HookManager
 from agent_harness.security.models import ApprovalPolicy, PermissionDecision, SandboxPolicy, ToolExecutionPrincipal
@@ -20,6 +20,8 @@ from agent_harness.security.permission_engine import PermissionEngine
 from agent_harness.tools.registry import ToolRegistry
 from agent_harness.utils.time import duration_ms, utc_now
 from agent_harness.artifacts.store import ArtifactSource, ArtifactStore
+from agent_harness.checkpoints.store import CheckpointStore
+from agent_harness.checkpoints.manager import stable_action_id
 
 
 @dataclass(slots=True)
@@ -34,6 +36,8 @@ class ToolRuntime:
     audit: Callable[[str, dict[str, Any]], None] | None = None
     approval_grants: ApprovalGrantStore = field(default_factory=ApprovalGrantStore)
     artifact_store: ArtifactStore | None = None
+    checkpoint_store: CheckpointStore | None = None
+    approval_boundary: Callable[[str, str], None] | None = None
     _executed_approvals: set[str] = field(default_factory=set)
 
     async def execute(self, call: ToolCall, principal: ToolExecutionPrincipal | None = None) -> ToolResult:
@@ -139,9 +143,25 @@ class ToolRuntime:
             side_effect=definition.side_effect,
             annotations=dict(definition.metadata.get("mcp_annotations", {})),
             annotations_trusted=bool(definition.metadata.get("mcp_annotation_trusted", False)),
+            approval_id=stable_approval_id(principal, call.id, args),
         )
         self._emit("approval.requested", {"approval_id": request.approval_id, "tool_call_id": call.id, "tool": call.name, "agent_id": principal.agent_id, "thread_id": principal.thread_id, "turn_id": principal.turn_id, "config_scope": request.config_scope, "server": request.server_name, "identity_summary": request.identity_summary, "remote_tool": request.remote_tool_name, "approval_mode": request.effective_approval_mode, "approval_source": request.approval_source, "side_effect": request.side_effect.value, "annotations": request.annotations, "annotations_trusted": request.annotations_trusted, "arguments": request.argument_preview})
-        approval = await self.approval_handler.request(request)
+        action_id = stable_action_id(principal.thread_id, principal.turn_id, call.id)
+        approval: ApprovalDecision
+        previous = self.checkpoint_store.approval_decision(request.approval_id) if self.checkpoint_store else None
+        if previous:
+            approval = ApprovalDecision(previous)
+        else:
+            if self.checkpoint_store:
+                approval_payload = {"tool_call_id": call.id, "tool": call.name, "arguments": redacted, "agent_id": principal.agent_id}
+                self.checkpoint_store.save_approval(request.approval_id, action_id, principal.thread_id, principal.turn_id, approval_payload, "pending")
+                if self.approval_boundary:
+                    self.approval_boundary("requested", request.approval_id)
+            approval = await self.approval_handler.request(request)
+            if self.checkpoint_store:
+                self.checkpoint_store.save_approval(request.approval_id, action_id, principal.thread_id, principal.turn_id, approval_payload, "decided", approval.value)
+                if self.approval_boundary:
+                    self.approval_boundary("decided", request.approval_id)
         self._emit("approval.decided", {"approval_id": request.approval_id, "tool_call_id": call.id, "decision": approval.value})
         if approval == ApprovalDecision.CANCEL_TURN:
             raise TurnCancellationRequested(request.approval_id, call.name)

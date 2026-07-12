@@ -25,6 +25,7 @@ class ContextBuilder:
     skill_catalog: SkillCatalogSnapshot | None = None
     active_skills_provider: Callable[[], tuple[SkillActivationSnapshot, ...]] | None = None
     enabled_tools_provider: Callable[[list[str]], list[str]] | None = None
+    retrieved_memory_provider: Callable[[], str] | None = None
 
     def build(self, run: RunState, agent: AgentDefinition, registry: ToolRegistry) -> ModelRequest:
         """Build one model request without appending durable guidance to conversation history."""
@@ -59,6 +60,10 @@ class ContextBuilder:
         active = self.active_skills_provider() if self.active_skills_provider else ()
         if active:
             sections.append(_render_active_skills(active))
+        if self.retrieved_memory_provider:
+            memory = self.retrieved_memory_provider()
+            if memory:
+                sections.append(memory)
         sections.append("Runtime Permission 和 Tool Policy 始终优先；Skill 不能扩大工具权限；更具体路径 Guidance 优先。")
         return "\n\n".join(sections)
 

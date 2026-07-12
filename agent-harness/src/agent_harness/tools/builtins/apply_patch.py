@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path
 
 from agent_harness.domain.errors import ToolInputValidationError
-from agent_harness.domain.tools import ToolDefinition
+from agent_harness.domain.tools import ToolDefinition, ToolEffectClass, ToolRecoveryPolicy
 from agent_harness.security.models import Capability, RiskLevel, SideEffectType
 from agent_harness.security.path_policy import FileSystemPolicy
 
@@ -36,6 +36,8 @@ def create_apply_patch_tool(workspace_root: Path, timeout_seconds: int = 30) -> 
         risk_level=RiskLevel.MEDIUM,
         side_effect=SideEffectType.FILESYSTEM,
         required_capabilities=frozenset({Capability.FILE_WRITE}),
+        effect_class=ToolEffectClass.RECONCILABLE_WRITE,
+        recovery_policy=ToolRecoveryPolicy.VERIFY_THEN_SYNTHESIZE,
     )
 
 
@@ -47,4 +49,3 @@ def _replace_exact(path: Path, old_text: str, new_text: str) -> dict:
         raise ToolInputValidationError("old_text must match exactly once", details={"path": str(path), "matches": count})
     path.write_text(content.replace(old_text, new_text, 1), encoding="utf-8")
     return {"path": str(path), "replacements": 1, "chars_delta": len(new_text) - len(old_text)}
-

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, Awaitable, Callable, Literal
 
 from agent_harness.domain.messages import ToolCall
@@ -9,6 +10,26 @@ from agent_harness.utils.time import utc_now
 
 ToolStatus = Literal["success", "error", "cancelled", "timeout"]
 ToolExecutor = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | str]]
+
+
+class ToolEffectClass(StrEnum):
+    """Durable recovery classification for a tool's observable effects."""
+
+    PURE = "pure"
+    READ_ONLY = "read_only"
+    IDEMPOTENT_WRITE = "idempotent_write"
+    RECONCILABLE_WRITE = "reconcilable_write"
+    NON_IDEMPOTENT_WRITE = "non_idempotent_write"
+
+
+class ToolRecoveryPolicy(StrEnum):
+    """Deterministic policy for a started tool lacking a durable result."""
+
+    RETRY_SAFE = "retry_safe"
+    VERIFY_THEN_RETRY = "verify_then_retry"
+    VERIFY_THEN_SYNTHESIZE = "verify_then_synthesize"
+    MANUAL_RECONCILIATION = "manual_reconciliation"
+    NEVER_RETRY = "never_retry"
 
 
 @dataclass(slots=True)
@@ -24,6 +45,8 @@ class ToolDefinition:
     required_capabilities: frozenset[Capability] = field(default_factory=lambda: frozenset({Capability.FILE_READ}))
     requires_sandbox: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    effect_class: ToolEffectClass = ToolEffectClass.READ_ONLY
+    recovery_policy: ToolRecoveryPolicy = ToolRecoveryPolicy.RETRY_SAFE
 
     def __post_init__(self) -> None:
         """Normalize legacy string metadata into the phase 3 security enums."""
@@ -35,6 +58,8 @@ class ToolDefinition:
         self.required_capabilities = frozenset(
             value if isinstance(value, Capability) else Capability(str(value)) for value in self.required_capabilities
         )
+        self.effect_class = ToolEffectClass(self.effect_class)
+        self.recovery_policy = ToolRecoveryPolicy(self.recovery_policy)
 
     def to_model_schema(self) -> dict[str, Any]:
         """Convert this internal tool definition to a model-visible function schema."""

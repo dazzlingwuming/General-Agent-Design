@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+from dataclasses import replace
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -9,6 +11,7 @@ from typing import Callable
 
 from agent_harness.rollout.items import RolloutItem
 from agent_harness.utils.serialization import to_jsonable
+from agent_harness.rollout.integrity import hash_item, load_verified
 
 
 @dataclass(slots=True)
@@ -45,6 +48,9 @@ class RolloutRecorder:
         self._state = RecorderState.OPEN
         self._failure: BaseException | None = None
         self._on_failure = on_failure
+        existing = load_verified(rollout_path) if rollout_path.exists() else []
+        self._sequence = max((item.sequence_number for item in existing), default=0)
+        self._previous_hash = next((item.item_hash for item in reversed(existing) if item.item_hash), "")
 
     def start(self) -> None:
         """Start the background writer task if it is not already running."""
@@ -148,4 +154,10 @@ class RolloutRecorder:
         self.rollout_path.parent.mkdir(parents=True, exist_ok=True)
         with self.rollout_path.open("a", encoding="utf-8") as handle:
             for item in items:
-                handle.write(json.dumps(to_jsonable(item), ensure_ascii=False) + "\n")
+                self._sequence += 1
+                durable = replace(item, schema_version=2, sequence_number=self._sequence, previous_hash=self._previous_hash, item_hash="")
+                durable = replace(durable, item_hash=hash_item(durable))
+                handle.write(json.dumps(to_jsonable(durable), ensure_ascii=False, sort_keys=True) + "\n")
+                self._previous_hash = durable.item_hash
+            handle.flush()
+            os.fsync(handle.fileno())

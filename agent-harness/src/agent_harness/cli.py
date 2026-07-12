@@ -25,6 +25,9 @@ from agent_harness.utils.atomic_files import atomic_write_json
 from agent_harness.mcp.config import parse_server_config
 from agent_harness.mcp.models import MCPConfigScope
 from agent_harness.mcp.connection import MCPServerConnection
+from agent_harness.checkpoints.store import CheckpointStore
+from agent_harness.recovery.coordinator import RecoveryCoordinator
+from agent_harness.memory.store import MemoryStore, project_identity
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -90,6 +93,24 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--sandbox", choices=[mode.value for mode in SandboxMode])
     resume.add_argument("--approval-policy", choices=[policy.value for policy in ApprovalPolicy])
     resume.add_argument("--danger-full-access", action="store_true")
+
+    recover = sub.add_parser("recover")
+    recover.add_argument("thread_id")
+    recover.add_argument("--status", action="store_true")
+
+    memory = sub.add_parser("memory")
+    memory_sub = memory.add_subparsers(dest="memory_command", required=True)
+    memory_sub.add_parser("list")
+    memory_search = memory_sub.add_parser("search")
+    memory_search.add_argument("query")
+    memory_add = memory_sub.add_parser("add")
+    memory_add.add_argument("content")
+    memory_add.add_argument("--thread-id", default="user")
+    memory_invalidate = memory_sub.add_parser("invalidate")
+    memory_invalidate.add_argument("memory_id")
+    memory_invalidate.add_argument("--reason", default="user_invalidated")
+    memory_delete = memory_sub.add_parser("delete")
+    memory_delete.add_argument("memory_id")
 
     inspect = sub.add_parser("inspect")
     inspect.add_argument("id")
@@ -307,6 +328,9 @@ async def _resume(args: argparse.Namespace) -> int:
         print(f"Thread ID: {session.session_id}")
         print(f"Workspace: {session.state.workspace_root if session.state else Path.cwd()}")
         print("输入 /exit 退出，/new 开启新 Thread，/status 查看当前 Thread。")
+        recovered = await session.continue_incomplete_turn()
+        if recovered and recovered.final_output:
+            print("\n已恢复原 Turn：\n" + recovered.final_output)
         while True:
             try:
                 task = input("\n> ").strip()
@@ -577,6 +601,46 @@ def _inspect(args: argparse.Namespace) -> int:
     return 0
 
 
+def _recover(args: argparse.Namespace) -> int:
+    """Inspect the deterministic recovery plan for one thread."""
+    config = load_config()
+    store = CheckpointStore((Path.cwd() / config.persistence.runtime_db).resolve())
+    checkpoint = store.latest(args.thread_id)
+    if checkpoint is None:
+        print(f"未找到 Checkpoint：{args.thread_id}")
+        return 1
+    plan = RecoveryCoordinator().plan(checkpoint)
+    print(json.dumps({"thread_id": args.thread_id, "turn_id": checkpoint.turn_id, "checkpoint_id": checkpoint.checkpoint_id,
+        "resume_point": checkpoint.resume_point.value, "status": checkpoint.turn_status.value,
+        "disposition": plan.disposition.value, "reason": plan.reason}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _memory_command(args: argparse.Namespace) -> int:
+    """Manage project-isolated long-term memories without starting a model provider."""
+    config = load_config()
+    root = Path.cwd().resolve()
+    store = MemoryStore((root / config.memory.database).resolve())
+    identity = project_identity(root)
+    if args.memory_command == "add":
+        record = store.create_explicit(args.content, project_identity=identity, thread_id=args.thread_id)
+        print(record.memory_id)
+        return 0
+    if args.memory_command == "search":
+        records = store.search(args.query, project_identity=identity, limit=config.memory.max_results)
+    elif args.memory_command == "list":
+        records = store.list(project_identity=identity)
+    elif args.memory_command == "invalidate":
+        return 0 if store.invalidate(args.memory_id, args.reason) else 1
+    elif args.memory_command == "delete":
+        return 0 if store.delete(args.memory_id) else 1
+    else:
+        return 2
+    for record in records:
+        print(f"{record.memory_id}\t{record.verification_status.value}\t{record.content}")
+    return 0
+
+
 def _migrate_sessions(args: argparse.Namespace) -> int:
     """Migrate legacy session transcripts into append-only thread rollout files."""
     session_root = Path(args.session_dir)
@@ -770,6 +834,10 @@ def main(argv: list[str] | None = None) -> int:
         return _sessions(args)
     if args.command == "inspect":
         return _inspect(args)
+    if args.command == "recover":
+        return _recover(args)
+    if args.command == "memory":
+        return _memory_command(args)
     if args.command == "migrate-sessions":
         return _migrate_sessions(args)
     if args.command == "mcp":

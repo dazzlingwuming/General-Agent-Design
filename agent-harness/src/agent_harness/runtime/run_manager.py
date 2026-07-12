@@ -55,6 +55,10 @@ from agent_harness.config import default_user_config_path
 from agent_harness.security.approval import ConsoleApprovalHandler
 from agent_harness.security.approval_grants import ApprovalGrantStore
 from agent_harness.artifacts.store import ArtifactStore
+from agent_harness.checkpoints.manager import CheckpointManager
+from agent_harness.checkpoints.store import CheckpointStore
+from agent_harness.checkpoints.models import ResumePoint
+from agent_harness.memory.store import MemoryStore, project_identity, render_memories
 
 
 class SubsystemInitState(StrEnum):
@@ -88,6 +92,9 @@ class RunManager:
     approval_grants: ApprovalGrantStore = field(default_factory=ApprovalGrantStore)
     artifact_store: ArtifactStore | None = None
     turn_steer_mailbox: list[str] = field(default_factory=list)
+    checkpoint_store: CheckpointStore | None = None
+    memory_store: MemoryStore | None = None
+    resume_point: ResumePoint | None = None
 
     async def run(self, task: str, workspace: Path) -> RunState:
         """Create a run state, wire dependencies, execute the loop, and save summary."""
@@ -106,6 +113,14 @@ class RunManager:
     async def run_existing(self, state: RunState, trace_root: Path) -> RunState:
         """Run one turn against an existing state so interactive sessions keep history."""
         root = state.workspace_root.resolve()
+        if self.config.persistence.enabled and self.checkpoint_store is None:
+            self.checkpoint_store = CheckpointStore((root / self.config.persistence.runtime_db).resolve())
+        if self.config.memory.enabled and self.memory_store is None:
+            self.memory_store = MemoryStore((root / self.config.memory.database).resolve())
+        checkpoint_manager = None
+        if self.checkpoint_store and state.turn_id:
+            checkpoint_manager = CheckpointManager(self.checkpoint_store, state.run_id, self.config.provider.name, self.config.provider.model)
+            checkpoint_manager.resume_sequence(state.turn_id)
         paths = self.project_paths or resolve_project_paths(root, root)
         trace = JsonlTraceSink(state.run_id, trace_root, fail_on_write_error=self.config.trace.fail_on_write_error)
         self.ensure_artifact_store((trace_root / state.run_id / "artifacts").resolve())
@@ -198,6 +213,7 @@ class RunManager:
                 skill_catalog=self.skill_catalog,
                 active_skills_provider=lambda: tuple(self.skill_manager.active) if self.skill_manager else (),
                 enabled_tools_provider=lambda tools: self._effective_tools(state.turn_id or "turn_unknown", tools),
+                retrieved_memory_provider=lambda: self._retrieved_memory(state),
             ),
             tool_runtime=ToolRuntime(
                 registry=registry,
@@ -209,6 +225,8 @@ class RunManager:
                 audit=lambda event, payload: self._emit_security_audit(trace, event, payload),
                 approval_grants=self.approval_grants,
                 artifact_store=self.artifact_store,
+                checkpoint_store=self.checkpoint_store,
+                approval_boundary=lambda phase, approval_id: self._approval_checkpoint(checkpoint_manager, state, phase),
             ),
             trace=trace,
             final_guard=lambda: (
@@ -221,7 +239,10 @@ class RunManager:
             enabled_tools_provider=lambda tools: self._effective_tools(state.turn_id or "turn_unknown", tools),
             tool_success_callback=lambda name, arguments: self._update_working_set(root, name, arguments),
             mailbox_provider=self._drain_turn_steer_mailbox,
+            checkpoint_manager=checkpoint_manager,
+            resume_point=self.resume_point,
         )
+        self.resume_point = None
         try:
             if invocation_service:
                 pending = list(self.pending_skill_invocations)
@@ -241,6 +262,20 @@ class RunManager:
             state.agent_summary = scheduler.summary()
             write_result_summary(state, trace.run_dir, trace.path)
             trace.close()
+
+    def _retrieved_memory(self, state: RunState) -> str:
+        """Retrieve project-isolated auxiliary memory for the current task within budget."""
+        if not self.memory_store or not self.config.memory.read_enabled or not state.task.strip():
+            return ""
+        identity = project_identity(state.workspace_root)
+        records = self.memory_store.search(state.task, project_identity=identity, limit=self.config.memory.max_results, agent_name=state.agent_name)
+        max_chars = int(self.config.context.max_estimated_input_tokens * self.config.context.char_to_token_ratio * self.config.memory.max_context_fraction)
+        return render_memories(records, max_chars)
+
+    def _approval_checkpoint(self, manager: CheckpointManager | None, state: RunState, phase: str) -> None:
+        """Commit approval boundaries without exposing database details to ToolRuntime."""
+        if manager:
+            manager.save(state, ResumePoint.WAITING_APPROVAL if phase == "requested" else ResumePoint.BEFORE_TOOL)
 
     def ensure_artifact_store(self, artifact_root: Path) -> ArtifactStore:
         """Create or reuse the thread-owned ArtifactStore at the configured trace path."""

@@ -23,6 +23,11 @@ from agent_harness.artifacts.store import ArtifactSource
 from agent_harness.project.roots import resolve_project_paths
 from agent_harness.skills.invocation import SkillInvocationRequest, SkillInvocationSource
 from agent_harness.guidance.trust import ProjectTrustContext, TrustDecisionSource, WorkspaceTrustState, resolve_project_trust
+from agent_harness.checkpoints.store import CheckpointStore
+from agent_harness.checkpoints.serializer import restore_run_state
+from agent_harness.checkpoints.models import ResumePoint
+from agent_harness.recovery.coordinator import RecoveryCoordinator, RecoveryDisposition
+from agent_harness.compaction.service import CompactionService
 
 
 @dataclass(slots=True)
@@ -40,6 +45,7 @@ class ConversationSession:
     trust_context: ProjectTrustContext | None = None
     pending_external_context: list[ExternalContextItem] = field(default_factory=list)
     external_context_hashes: set[str] = field(default_factory=set)
+    incomplete_turn: bool = False
 
     def __post_init__(self) -> None:
         """Initialize the local thread store used by this conversation wrapper."""
@@ -102,10 +108,42 @@ class ConversationSession:
         self.manager.rollout_audit = lambda event, payload: self._record_audit_item(event, None, payload)
         resume_cwd = live.state.cwd or live.state.workspace_root
         self.manager.project_paths = resolve_project_paths(resume_cwd, live.state.workspace_root)
+        if self.config.persistence.enabled:
+            checkpoint_store = CheckpointStore((live.state.workspace_root / self.config.persistence.runtime_db).resolve())
+            self.manager.checkpoint_store = checkpoint_store
+            checkpoint = checkpoint_store.latest(thread_id)
+            if checkpoint and checkpoint.resume_point != ResumePoint.TERMINAL:
+                plan = RecoveryCoordinator().plan(checkpoint)
+                if plan.disposition in {RecoveryDisposition.CONTINUE, RecoveryDisposition.RETRY}:
+                    self.state = restore_run_state(checkpoint.serialized_state, live.state.workspace_root)
+                    self.manager.resume_point = checkpoint.resume_point
+                    self.incomplete_turn = True
+                else:
+                    live.state.status = ThreadStatus.RECOVERY_REQUIRED
         self.trust_context = self.trust_context or self._legacy_trust_context()
         self.manager.initialize_project_context(self.thread_id, resume_cwd, trust_context=self.trust_context, resume=True)
         await self.manager.initialize_mcp()
         self.manager.rollout_audit = None
+
+    async def continue_incomplete_turn(self) -> RunState | None:
+        """Continue the original checkpointed turn without appending a new user turn."""
+        if not self.incomplete_turn or self.state is None or self.live_thread is None:
+            return None
+        self.incomplete_turn = False
+        turn_id = self.state.turn_id
+        self.manager.rollout_audit = lambda event, payload: self._record_audit_item(event, turn_id, payload)
+        try:
+            result = await self.manager.run_existing(self.state, self.config.trace.thread_directory)
+        finally:
+            self.manager.rollout_audit = None
+        controller = TurnController(self.live_thread, self.state.turn_id or "turn_unknown", self._item, self._write_turn_summary)
+        if result.status == RunStatus.COMPLETED:
+            await controller.complete(result)
+        elif result.status == RunStatus.CANCELLED:
+            await controller.cancel(result, "Recovered turn cancelled")
+        else:
+            await controller.fail(result)
+        return result
 
     async def run_turn(self, user_input: str) -> RunState:
         """Append one user message as a new turn, execute the agent loop, and persist items."""
@@ -146,11 +184,24 @@ class ConversationSession:
             self.manager.rollout_audit = None
         if state.status == RunStatus.COMPLETED:
             await controller.complete(state)
+            self._compact_idle_state(state)
         elif state.status == RunStatus.CANCELLED:
             await controller.cancel(state, "Turn execution cancelled")
         else:
             await controller.fail(state)
         return state
+
+    def _compact_idle_state(self, state: RunState) -> None:
+        """Compact model-visible history after terminal persistence without touching rollout JSONL."""
+        if not self.config.compaction.enabled or not self.config.compaction.auto_compact or not self.manager.checkpoint_store:
+            return
+        estimated = sum(len(message.content) for message in state.messages) / self.config.context.char_to_token_ratio
+        threshold = self.config.context.max_estimated_input_tokens * self.config.compaction.estimated_token_threshold
+        if estimated < threshold:
+            return
+        service = CompactionService(self.manager.checkpoint_store.database, retain_recent_turns=self.config.compaction.retain_recent_turns,
+            max_summary_chars=self.config.compaction.max_summary_chars)
+        service.compact(state)
 
     async def close(self) -> None:
         """Mark the live runtime closed without deleting its canonical history."""

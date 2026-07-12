@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
@@ -128,3 +130,10 @@ def redact_approval_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         return value
 
     return redact(arguments)
+
+
+def stable_approval_id(principal: ToolExecutionPrincipal, tool_call_id: str, arguments: dict[str, Any]) -> str:
+    """Derive an approval identity that remains stable across process restarts."""
+    argument_hash = hashlib.sha256(json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    material = "\0".join((principal.thread_id, principal.turn_id, principal.agent_id, tool_call_id, argument_hash))
+    return "approval_" + hashlib.sha256(material.encode()).hexdigest()

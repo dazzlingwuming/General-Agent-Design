@@ -5,12 +5,13 @@ import json
 from pathlib import Path
 from typing import Any
 
-from agent_harness.rollout.items import ItemStatus, RolloutItem, item_from_dict
+from agent_harness.rollout.items import RolloutItem
 from agent_harness.threads.live_thread import LiveThread
 from agent_harness.threads.recorder import RolloutRecorder
 from agent_harness.turns.state import ThreadState, ThreadStatus
 from agent_harness.utils.ids import new_id
 from agent_harness.utils.time import iso_now
+from agent_harness.rollout.integrity import load_verified
 
 
 class LocalThreadStore:
@@ -48,27 +49,11 @@ class LocalThreadStore:
         return live
 
     async def resume_thread(self, thread_id: str) -> LiveThread:
-        """Load a thread from metadata and mark incomplete turns interrupted during recovery."""
+        """Load a thread without inventing a terminal outcome for incomplete durable work."""
         metadata = await asyncio.to_thread(self._read_metadata, thread_id)
         state = self._state_from_metadata(metadata)
-        history = await self.load_history(thread_id)
-        active_turn_id = _active_turn_from_history(history)
         live = self._live_thread(state)
         try:
-            if active_turn_id:
-                item = RolloutItem.create(
-                    "turn.interrupted",
-                    session_id=state.session_id,
-                    thread_id=state.thread_id,
-                    turn_id=active_turn_id,
-                    status=ItemStatus.INTERRUPTED,
-                    payload={"reason": "recovered incomplete turn as interrupted"},
-                )
-                await live.append_items([item])
-                await live.flush()
-            state.status = ThreadStatus.IDLE
-            state.active_turn_id = None
-            await live.update_metadata({})
             return live
         except BaseException:
             await live.shutdown()
@@ -84,7 +69,7 @@ class LocalThreadStore:
             await live.shutdown()
 
     async def load_history(self, thread_id: str) -> list[RolloutItem]:
-        """Read rollout history while skipping malformed JSONL rows."""
+        """Read rollout history with fail-closed integrity and tail-only repair."""
         return await asyncio.to_thread(self._load_history_sync, thread_id)
 
     async def list_threads(self) -> list[dict[str, Any]]:
@@ -132,19 +117,9 @@ class LocalThreadStore:
         )
 
     def _load_history_sync(self, thread_id: str) -> list[RolloutItem]:
-        """Load rollout items from JSONL and ignore corrupted rows."""
+        """Load rollout items with sequence and hash validation."""
         path = self.root / thread_id / "rollout.jsonl"
-        if not path.exists():
-            return []
-        items: list[RolloutItem] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                items.append(item_from_dict(json.loads(line)))
-            except (json.JSONDecodeError, KeyError, ValueError, TypeError):
-                continue
-        return items
+        return load_verified(path)
 
     def _list_threads_sync(self) -> list[dict[str, Any]]:
         """Read every metadata.json row under the thread root."""

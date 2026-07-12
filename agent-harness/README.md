@@ -2,7 +2,7 @@
 
 这是一个本地 CLI Coding Agent Harness。当前产品形态是 Codex 式持续交互：进入一个代码目录后创建或恢复一个 Thread，用户连续输入，每次输入形成一个 Turn，消息、模型输出、工具结果和终态以 append-only Item 写入 rollout。
 
-当前还包含权限执行链、Project Guidance、Agent Skills 和 Stage 5 MCP Client Runtime。各阶段的真实完成差异见仓库根目录 `doc/`，沙箱和明确延期能力不能描述为已完成。
+当前还包含权限执行链、Project Guidance、Agent Skills、Stage 5 MCP Client Runtime，以及 Stage 6 的本地 Durable Checkpoint 与 Project Memory 基础。各阶段的真实完成差异见仓库根目录 `doc/`，沙箱和明确延期能力不能描述为已完成。
 
 ## 权限与沙箱
 
@@ -39,6 +39,11 @@ wsl -d Ubuntu -- sudo apt-get install -y bubblewrap
 - 执行时 Tool allowlist / capability 检查
 - 文件工具使用 `asyncio.to_thread()` 避免阻塞 event loop
 - 阶段 2 Subagent Runtime：spawn、wait、follow-up、cancel、close、structured result
+- SQLite WAL Checkpoint：`.harness/runtime.sqlite3`，支持同一 Turn 的安全边界恢复
+- 独立 Project Memory：`.harness/memory.sqlite3`，支持来源、验证状态、检索、失效和删除
+- Rollout v2：单调 sequence、SHA-256 hash chain、末尾损坏隔离和中间损坏 fail-closed
+- 持久审批 ID 与审批决定复用
+- Idle-only Context Compaction，不删除 canonical rollout
 
 ## 仍未完成
 
@@ -49,8 +54,9 @@ wsl -d Ubuntu -- sudo apt-get install -y bubblewrap
 - Native Windows Restricted Token / ACL / Job Object 沙箱后端
 - 审批后自动持久化用户规则
 - 通用 Unified Diff Patch Parser
-- Context Compaction 算法
-- 精确 checkpoint resume
+- Child Subagent 跨进程自动恢复和 budget reservation 持久化
+- `write_file` / `apply_patch` 的完整 pre/post hash 自动核对
+- `recover --mark-tool-*` 人工副作用核对命令
 
 ## 安装
 
@@ -102,6 +108,22 @@ agent-harness resume
 
 ```powershell
 agent-harness resume thread_xxx
+```
+
+检查恢复边界：
+
+```powershell
+agent-harness recover thread_xxx --status
+```
+
+管理当前项目长期记忆：
+
+```powershell
+agent-harness memory add "项目测试使用 uv run pytest"
+agent-harness memory search "pytest"
+agent-harness memory list
+agent-harness memory invalidate memory_xxx --reason "配置已变化"
+agent-harness memory delete memory_xxx
 ```
 
 一次性执行：
@@ -166,6 +188,7 @@ agent-harness tools --workspace tests/fixtures/demo_repo
 uv run --no-sync python -m ruff check src tests
 uv run --no-sync python -m mypy src
 uv run --no-sync python -m pytest -m "unit or integration_local" -q
+uv run --no-sync python -m pytest -m recovery_process -q
 uv run --no-sync python -m pytest -m platform_linux -q
 uv run --no-sync python -m pytest -m live_provider -q
 ```

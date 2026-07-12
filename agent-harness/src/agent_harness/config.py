@@ -146,6 +146,42 @@ class ArtifactConfig:
 
 
 @dataclass(slots=True)
+class PersistenceConfig:
+    """Local durable runtime database and recovery behavior."""
+
+    enabled: bool = True
+    runtime_db: Path = Path(".harness/runtime.sqlite3")
+    auto_recover_safe: bool = True
+    checkpoint_retention_per_turn: int = 20
+    fail_on_integrity_error: bool = True
+
+
+@dataclass(slots=True)
+class MemoryConfig:
+    """Independent project-memory storage and model-context limits."""
+
+    enabled: bool = True
+    read_enabled: bool = True
+    write_enabled: bool = True
+    auto_extract: bool = False
+    database: Path = Path(".harness/memory.sqlite3")
+    max_results: int = 10
+    max_context_fraction: float = 0.05
+
+
+@dataclass(slots=True)
+class CompactionConfig:
+    """Idle-only context compaction thresholds."""
+
+    enabled: bool = True
+    auto_compact: bool = True
+    idle_only: bool = True
+    estimated_token_threshold: float = 0.75
+    retain_recent_turns: int = 6
+    max_summary_chars: int = 12000
+
+
+@dataclass(slots=True)
 class HarnessConfig:
     """Top-level configuration object shared by CLI and runtime code."""
 
@@ -161,6 +197,9 @@ class HarnessConfig:
     skills: SkillsConfig = field(default_factory=SkillsConfig)
     mcp: MCPConfig = field(default_factory=MCPConfig)
     artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
+    persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
+    compaction: CompactionConfig = field(default_factory=CompactionConfig)
 
 
 MODEL_ALIASES = {
@@ -318,6 +357,33 @@ def load_config(path: Path | None = None) -> HarnessConfig:
         max_turn_bytes=int(artifact_data.get("max_turn_bytes", 20_000_000)),
         max_thread_bytes=int(artifact_data.get("max_thread_bytes", 100_000_000)),
     )
+    persistence_data = _section(raw, "persistence")
+    persistence = PersistenceConfig(
+        enabled=bool(persistence_data.get("enabled", True)),
+        runtime_db=Path(persistence_data.get("runtime_db", ".harness/runtime.sqlite3")),
+        auto_recover_safe=bool(persistence_data.get("auto_recover_safe", True)),
+        checkpoint_retention_per_turn=int(persistence_data.get("checkpoint_retention_per_turn", 20)),
+        fail_on_integrity_error=bool(persistence_data.get("fail_on_integrity_error", True)),
+    )
+    memory_data = _section(raw, "memory")
+    memory = MemoryConfig(
+        enabled=bool(memory_data.get("enabled", True)),
+        read_enabled=bool(memory_data.get("read_enabled", True)),
+        write_enabled=bool(memory_data.get("write_enabled", True)),
+        auto_extract=bool(memory_data.get("auto_extract", False)),
+        database=Path(memory_data.get("database", ".harness/memory.sqlite3")),
+        max_results=int(memory_data.get("max_results", 10)),
+        max_context_fraction=float(memory_data.get("max_context_fraction", 0.05)),
+    )
+    compaction_data = _section(raw, "compaction")
+    compaction = CompactionConfig(
+        enabled=bool(compaction_data.get("enabled", True)),
+        auto_compact=bool(compaction_data.get("auto_compact", True)),
+        idle_only=bool(compaction_data.get("idle_only", True)),
+        estimated_token_threshold=float(compaction_data.get("estimated_token_threshold", 0.75)),
+        retain_recent_turns=int(compaction_data.get("retain_recent_turns", 6)),
+        max_summary_chars=int(compaction_data.get("max_summary_chars", 12000)),
+    )
     trace_data = _section(raw, "trace")
     trace = TraceConfig(
         directory=Path(trace_data.get("directory", ".harness/runs")),
@@ -333,7 +399,7 @@ def load_config(path: Path | None = None) -> HarnessConfig:
     if env_url := os.getenv("DEEPSEEK_API_URL"):
         provider.base_url = env_url
     provider.model = normalize_model_name(provider.model)
-    return HarnessConfig(provider, agent, run, tools, context, trace, subagents, security, guidance, skills, mcp, artifacts)
+    return HarnessConfig(provider, agent, run, tools, context, trace, subagents, security, guidance, skills, mcp, artifacts, persistence, memory, compaction)
 
 
 def _load_permission_rules(raw: dict[str, Any], *, is_user_config: bool, trusted_project: bool) -> list[PermissionRule]:

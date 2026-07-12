@@ -19,6 +19,7 @@ class ThreadStatus(str, Enum):
     CLOSING = "CLOSING"
     CLOSED = "CLOSED"
     FAILED = "FAILED"
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
 
 
 class TurnStatus(str, Enum):

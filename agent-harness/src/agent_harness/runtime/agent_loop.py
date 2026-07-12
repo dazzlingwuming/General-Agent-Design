@@ -8,7 +8,7 @@ from agent_harness.context.builder import ContextBuilder
 from agent_harness.domain.agent import AgentDefinition
 from agent_harness.domain.errors import BudgetExceededError, CancellationError, HarnessError, ProviderProtocolError
 from agent_harness.domain.messages import CanonicalMessage
-from agent_harness.domain.model import ModelProvider, Usage
+from agent_harness.domain.model import ModelProvider, ModelResponse, Usage
 from agent_harness.domain.run import RunState, RunStatus
 from agent_harness.runtime.completion import CompletionPolicy, TextFinalCompletionPolicy
 from agent_harness.tools.runtime import ToolExecutionPrincipal, ToolRuntime
@@ -16,6 +16,8 @@ from agent_harness.security.models import ApprovalPolicy, Capability, SandboxMod
 from agent_harness.tracing.jsonl import JsonlTraceSink
 from agent_harness.runtime.budgets import check_iteration, check_model_calls, check_tool_calls, check_wall_time
 from agent_harness.utils.time import utc_now
+from agent_harness.checkpoints.manager import CheckpointManager, stable_action_id
+from agent_harness.checkpoints.models import DurableTurnStatus, ResumePoint
 
 
 @dataclass(slots=True)
@@ -38,6 +40,8 @@ class AgentLoop:
     principal_session_id: str | None = None
     principal_thread_id: str | None = None
     principal_agent_id: str | None = None
+    checkpoint_manager: CheckpointManager | None = None
+    resume_point: ResumePoint | None = None
 
     async def run(self, state: RunState) -> RunState:
         """Drive the single-agent model/tool loop until completion or failure."""
@@ -55,30 +59,42 @@ class AgentLoop:
                 state.iteration += 1
                 self._drain_mailbox(state)
                 self.trace.emit("iteration.started", iteration=state.iteration)
-                request = self.context_builder.build(state, self.agent, self.tool_runtime.registry)
-                self.trace.emit(
-                    "context.built",
-                    iteration=state.iteration,
-                    payload={"message_count": len(request.messages), "tool_count": len(request.tools)},
-                )
-                check_model_calls(state, self.agent.limits)
-                self.trace.emit("model.requested", iteration=state.iteration, payload={"model": request.model})
-                state.model_call_count += 1
-                response = await self.provider.complete(request)
-                self._add_usage(state, response.usage)
-                self.trace.emit(
-                    "model.completed",
-                    iteration=state.iteration,
-                    payload={"finish_reason": response.finish_reason, "tool_call_count": len(response.tool_calls)},
-                )
-                state.messages.append(response.assistant_message)
+                if self.resume_point == ResumePoint.AFTER_MODEL:
+                    response = self._committed_model_response(state)
+                    self.resume_point = None
+                    self.trace.emit("model.response_reused", iteration=state.iteration, payload={"tool_call_count": len(response.tool_calls)})
+                else:
+                    self._checkpoint(state, ResumePoint.BEFORE_MODEL)
+                    request = self.context_builder.build(state, self.agent, self.tool_runtime.registry)
+                    self.trace.emit(
+                        "context.built",
+                        iteration=state.iteration,
+                        payload={"message_count": len(request.messages), "tool_count": len(request.tools)},
+                    )
+                    check_model_calls(state, self.agent.limits)
+                    self.trace.emit("model.requested", iteration=state.iteration, payload={"model": request.model})
+                    state.model_call_count += 1
+                    self._checkpoint(state, ResumePoint.MODEL_IN_FLIGHT)
+                    response = await self.provider.complete(request)
+                    self._add_usage(state, response.usage)
+                    self.trace.emit(
+                        "model.completed",
+                        iteration=state.iteration,
+                        payload={"finish_reason": response.finish_reason, "tool_call_count": len(response.tool_calls)},
+                    )
+                    state.messages.append(response.assistant_message)
+                    self._checkpoint(state, ResumePoint.AFTER_MODEL)
                 if response.tool_calls:
-                    for call in response.tool_calls:
+                    completed_call_ids = {message.tool_call_id for message in state.messages if message.role == "tool"}
+                    for call in (item for item in response.tool_calls if item.id not in completed_call_ids):
                         if state.cancellation_requested:
                             raise CancellationError("Run cancellation requested")
                         check_tool_calls(state, self.agent.limits)
+                        action_id = stable_action_id(state.run_id, state.turn_id or "turn_unknown", call.id)
+                        self._checkpoint(state, ResumePoint.BEFORE_TOOL, pending_action_ids=(action_id,))
                         self.trace.emit("tool.requested", iteration=state.iteration, payload={"tool": call.name, "tool_call_id": call.id})
                         self.trace.emit("tool.started", iteration=state.iteration, payload={"tool": call.name, "tool_call_id": call.id})
+                        self._checkpoint(state, ResumePoint.TOOL_IN_FLIGHT, pending_action_ids=(action_id,))
                         result = await self.tool_runtime.execute(call, self._principal(state))
                         if result.status == "success" and self.tool_success_callback and isinstance(call.arguments, dict):
                             self.tool_success_callback(call.name, call.arguments)
@@ -92,18 +108,21 @@ class AgentLoop:
                                 metadata={"status": result.status, "error_code": result.error_code},
                             )
                         )
+                        self._checkpoint(state, ResumePoint.AFTER_TOOL)
                         self._drain_mailbox(state)
                         if result.status == "success" and call.name in terminal_tool_names:
                             state.final_output = result.content
                             state.status = RunStatus.COMPLETED
                             state.completed_at = utc_now()
                             state.updated_at = state.completed_at
+                            self._checkpoint(state, ResumePoint.BEFORE_FINALIZE)
                             self.trace.emit(
                                 "agent.result_submitted",
                                 iteration=state.iteration,
                                 payload={"tool": call.name, "tool_call_id": call.id},
                             )
                             self.trace.emit("iteration.completed", iteration=state.iteration, payload={"continued": False})
+                            self._checkpoint(state, ResumePoint.TERMINAL, DurableTurnStatus.COMPLETED)
                             return state
                         event_name = "tool.completed" if result.status == "success" else "tool.failed"
                         if result.status == "timeout":
@@ -131,11 +150,13 @@ class AgentLoop:
                     self.trace.emit("iteration.completed", iteration=state.iteration, payload={"continued": True, "guarded": True})
                     continue
                 state.final_output = final_text
+                self._checkpoint(state, ResumePoint.BEFORE_FINALIZE)
                 state.status = RunStatus.COMPLETED
                 state.completed_at = utc_now()
                 state.updated_at = state.completed_at
                 self.trace.emit("iteration.completed", iteration=state.iteration, payload={"continued": False})
                 self.trace.emit("run.completed", iteration=state.iteration, payload={"final_output_chars": len(final_text)})
+                self._checkpoint(state, ResumePoint.TERMINAL, DurableTurnStatus.COMPLETED)
                 return state
             return state
         except asyncio.CancelledError as exc:
@@ -151,6 +172,7 @@ class AgentLoop:
             state.updated_at = state.completed_at
             state.error = exc.to_run_error()
             self.trace.emit("run.cancelled", iteration=state.iteration, payload={"error": state.error})
+            self._checkpoint(state, ResumePoint.TERMINAL, DurableTurnStatus.CANCELLED)
             return state
         except BudgetExceededError as exc:
             state.status = RunStatus.FAILED
@@ -159,6 +181,7 @@ class AgentLoop:
             state.error = exc.to_run_error()
             self.trace.emit("budget.exceeded", iteration=state.iteration, payload=state.error.details)
             self.trace.emit("run.failed", iteration=state.iteration, payload={"error": state.error})
+            self._checkpoint(state, ResumePoint.TERMINAL, DurableTurnStatus.FAILED)
             return state
         except HarnessError as exc:
             state.status = RunStatus.FAILED
@@ -166,6 +189,7 @@ class AgentLoop:
             state.updated_at = state.completed_at
             state.error = exc.to_run_error()
             self.trace.emit("run.failed", iteration=state.iteration, payload={"error": state.error})
+            self._checkpoint(state, ResumePoint.TERMINAL, DurableTurnStatus.FAILED)
             return state
         except Exception as exc:
             state.status = RunStatus.FAILED
@@ -173,7 +197,27 @@ class AgentLoop:
             state.updated_at = state.completed_at
             state.error = HarnessError(str(exc)).to_run_error()
             self.trace.emit("run.failed", iteration=state.iteration, payload={"error": state.error})
+            self._checkpoint(state, ResumePoint.TERMINAL, DurableTurnStatus.FAILED)
             return state
+
+    def _checkpoint(
+        self,
+        state: RunState,
+        point: ResumePoint,
+        status: DurableTurnStatus = DurableTurnStatus.RUNNING,
+        *,
+        pending_action_ids: tuple[str, ...] = (),
+    ) -> None:
+        """Persist one safe boundary when durable runtime support is enabled."""
+        if self.checkpoint_manager:
+            self.checkpoint_manager.save(state, point, status, pending_action_ids=pending_action_ids)
+
+    def _committed_model_response(self, state: RunState) -> ModelResponse:
+        """Rebuild the latest durable model response without issuing a provider request."""
+        message = next((item for item in reversed(state.messages) if item.role == "assistant"), None)
+        if message is None:
+            raise ProviderProtocolError("AFTER_MODEL checkpoint has no durable assistant message")
+        return ModelResponse(assistant_message=message, tool_calls=list(message.tool_calls), finish_reason="tool_calls" if message.tool_calls else "stop")
 
     def _add_usage(self, state: RunState, usage: Usage) -> None:
         """Accumulate provider token usage fields when the provider returns them."""
