@@ -1,6 +1,7 @@
 name: agent-harness
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - "agent-harness/**"
@@ -10,8 +11,51 @@ on:
       - "agent-harness/**"
       - ".github/workflows/agent-harness.yml"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-harness-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  core:
+    name: Core (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11"]
+    defaults:
+      run:
+        working-directory: agent-harness
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.8.17"
+          enable-cache: true
+          cache-dependency-glob: agent-harness/uv.lock
+      - name: Sync locked environment
+        run: uv sync --locked --extra test
+      - name: Tool versions
+        run: |
+          uv --version
+          uv run --no-sync python -c "from importlib.metadata import version; print('mypy', version('mypy')); print('pytest', version('pytest')); print('ruff', version('ruff'))"
+      - name: Ruff
+        run: uv run --no-sync python -m ruff check src tests
+      - name: Mypy
+        run: uv run --no-sync python -m mypy src
+      - name: Core tests
+        run: uv run --no-sync python -m pytest -m "unit or integration_local" -q
+
+  platform-linux:
+    name: Linux platform acceptance
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -21,14 +65,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.8.17"
+          enable-cache: true
+          cache-dependency-glob: agent-harness/uv.lock
       - name: Install bubblewrap and package
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap
-          python -m pip install -e ".[test]"
-      - name: Ruff
-        run: python -m ruff check src tests
-      - name: Mypy
-        run: python -m mypy src
-      - name: Tests
-        run: python -m pytest -q
+          uv sync --locked --extra test
+      - name: Linux platform tests
+        run: uv run --no-sync python -m pytest -m platform_linux -q

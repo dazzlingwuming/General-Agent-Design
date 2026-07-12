@@ -24,6 +24,7 @@ from agent_harness.tools.runtime import ToolRuntime
 from agent_harness.tracing.jsonl import JsonlTraceSink
 from agent_harness.utils.serialization import to_jsonable
 from agent_harness.utils.time import utc_now
+from agent_harness.artifacts.store import ArtifactStore
 
 
 @dataclass(slots=True)
@@ -37,6 +38,7 @@ class SubagentScheduler:
     trace: JsonlTraceSink
     agent_registry: AgentRegistry
     mcp_runtime: Any | None = None
+    artifact_store: ArtifactStore | None = None
     max_concurrent: int = 3
     max_total: int = 8
     max_depth: int = 1
@@ -150,16 +152,21 @@ class SubagentScheduler:
         return self.status(agent_id)
 
     async def cancel(self, agent_id: str) -> dict[str, Any]:
-        """Cancel one child task without cancelling sibling agents."""
+        """Request cancellation and wait until the owned child task finishes cleanup."""
         thread = self._get(agent_id)
+        if thread.status in {AgentThreadStatus.CANCELLED, AgentThreadStatus.CLOSED, AgentThreadStatus.FAILED}:
+            return self.status(agent_id)
         thread.status = AgentThreadStatus.CANCELLING
         task = self._tasks.get(agent_id)
+        self.trace.emit("agent.cancel_requested", payload={"agent_id": agent_id})
         if task and not task.done():
             task.cancel()
-            thread.status = AgentThreadStatus.CANCELLED
-        else:
-            thread.status = AgentThreadStatus.CANCELLED
-        self.trace.emit("agent.cancel_requested", payload={"agent_id": agent_id})
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if thread.status == AgentThreadStatus.CANCELLING:
+            self._mark_cancelled(thread)
         async with self._condition:
             self._condition.notify_all()
         return self.status(agent_id)
@@ -244,10 +251,15 @@ class SubagentScheduler:
                         char_to_token_ratio=self.config.context.char_to_token_ratio,
                         max_estimated_input_tokens=self.config.context.max_estimated_input_tokens,
                     ),
-                    tool_runtime=ToolRuntime(registry=registry, max_result_chars=self.config.tools.max_result_chars),
+                    tool_runtime=ToolRuntime(registry=registry, max_result_chars=self.config.tools.max_result_chars, artifact_store=self.artifact_store, audit=lambda event, payload: self._emit_child_audit(thread, event, payload)),
                     trace=self.trace,
                     completion_policy=StructuredSubagentCompletionPolicy(max_repairs=1),
                     mailbox_provider=lambda: self._drain_mailbox(thread),
+                    parent_agent_id=thread.parent_agent_id,
+                    depth=thread.depth,
+                    principal_session_id=thread.run_id,
+                    principal_thread_id=thread.thread_id,
+                    principal_agent_id=thread.agent_id,
                 )
                 result_state = await loop.run(state)
                 if result_state.final_output and result_state.status.value == "COMPLETED":
@@ -298,9 +310,7 @@ class SubagentScheduler:
                     depth=thread.depth,
                 )
         except asyncio.CancelledError:
-            thread.status = AgentThreadStatus.CANCELLED
-            thread.error = CancellationError("Child agent cancelled").to_run_error()
-            self.trace.emit("agent.cancelled", payload={"agent_id": thread.agent_id})
+            self._mark_cancelled(thread)
             raise
         except Exception as exc:
             thread.status = AgentThreadStatus.FAILED
@@ -340,6 +350,10 @@ class SubagentScheduler:
         thread.mailbox.clear()
         return messages
 
+    def _emit_child_audit(self, thread: AgentThreadState, event: str, payload: dict[str, Any]) -> None:
+        """Write one child permission or approval event with full principal attribution."""
+        self.trace.emit(event, payload=payload, agent_id=thread.agent_id, thread_id=thread.thread_id, parent_agent_id=thread.parent_agent_id, depth=thread.depth)
+
     def _make_success_result(self, thread: AgentThreadState, payload: dict[str, Any]) -> SubagentResult:
         """Convert submit_result payload into a SubagentResult envelope."""
         return SubagentResult(
@@ -371,6 +385,14 @@ class SubagentScheduler:
     def _is_done(self, agent_id: str) -> bool:
         """Return whether a thread has reached a waitable terminal or idle state."""
         return self._get(agent_id).status in {AgentThreadStatus.IDLE, AgentThreadStatus.FAILED, AgentThreadStatus.CANCELLED, AgentThreadStatus.CLOSED}
+
+    def _mark_cancelled(self, thread: AgentThreadState) -> None:
+        """Write the child cancellation terminal state exactly once after task completion."""
+        if thread.status == AgentThreadStatus.CANCELLED:
+            return
+        thread.status = AgentThreadStatus.CANCELLED
+        thread.error = CancellationError("Child agent cancelled").to_run_error()
+        self.trace.emit("agent.cancelled", payload={"agent_id": thread.agent_id})
 
     def _get(self, agent_id: str) -> AgentThreadState:
         """Return a child thread by id or raise a readable error."""

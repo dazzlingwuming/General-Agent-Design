@@ -1,8 +1,8 @@
-# Agent Harness 阶段 2 + Thread/Turn/Item 修复
+# Agent Harness
 
 这是一个本地 CLI Coding Agent Harness。当前产品形态是 Codex 式持续交互：进入一个代码目录后创建或恢复一个 Thread，用户连续输入，每次输入形成一个 Turn，消息、模型输出、工具结果和终态以 append-only Item 写入 rollout。
 
-当前还包含阶段 3 第一版安全执行链：Permission、Approval、Hooks、结构化命令和可替换 Sandbox Backend。
+当前还包含权限执行链、Project Guidance、Agent Skills 和 Stage 5 MCP Client Runtime。各阶段的真实完成差异见仓库根目录 `doc/`，沙箱和明确延期能力不能描述为已完成。
 
 ## 权限与沙箱
 
@@ -56,6 +56,12 @@ wsl -d Ubuntu -- sudo apt-get install -y bubblewrap
 
 ```bash
 python -m pip install -e .[test]
+```
+
+开发和 CI 使用锁定环境：
+
+```bash
+uv sync --locked --extra test
 ```
 
 ## 交互式使用
@@ -157,11 +163,14 @@ agent-harness tools --workspace tests/fixtures/demo_repo
 ## 测试
 
 ```bash
-pytest
-pytest -m live
+uv run --no-sync python -m ruff check src tests
+uv run --no-sync python -m mypy src
+uv run --no-sync python -m pytest -m "unit or integration_local" -q
+uv run --no-sync python -m pytest -m platform_linux -q
+uv run --no-sync python -m pytest -m live_provider -q
 ```
 
-默认测试使用 Fake Provider，不会调用真实 API。Live tests 会读取真实配置；如果没有 `DEEPSEEK_API_KEY`，会自动跳过。
+默认核心测试使用 Fake Provider 或本地 fixture，不调用真实 API。平台测试和 live tests 单独选择；缺少对应平台能力或 `DEEPSEEK_API_KEY` 时会明确跳过，skip 不等于平台验收通过。
 
 ## Project Guidance
 

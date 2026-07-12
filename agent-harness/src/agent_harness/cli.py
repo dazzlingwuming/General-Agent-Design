@@ -443,7 +443,8 @@ async def _phase4_command(command: str, session: ConversationSession) -> bool:
                 print("用法：/mcp resource <server> <uri>")
                 return True
             payload = await runtime.manager.active_servers[parts[0]].read_resource(parts[1])
-            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            queued = await session.queue_external_context("mcp_resource", parts[0], parts[1], payload)
+            print("资源已加入下一轮上下文。" if queued else "相同资源内容已存在，未重复加入。")
             return True
         if command.startswith("/mcp prompts"):
             server = command.removeprefix("/mcp prompts").strip() or None
@@ -459,7 +460,8 @@ async def _phase4_command(command: str, session: ConversationSession) -> bool:
                 return True
             values = dict(item.split("=", maxsplit=1) for item in parts[1:] if "=" in item)
             payload = await runtime.manager.active_servers[target[0]].get_prompt(target[1], values or None)
-            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            queued = await session.queue_external_context("mcp_prompt", target[0], target[1], payload)
+            print("Prompt 已加入下一轮上下文。" if queued else "相同 Prompt 内容已存在，未重复加入。")
             return True
         if command != "/mcp":
             return False

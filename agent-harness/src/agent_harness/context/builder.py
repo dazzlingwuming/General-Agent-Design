@@ -73,7 +73,7 @@ class ContextBuilder:
         """Keep only recent user turns and their following assistant/tool messages."""
         if self.recent_turns <= 0:
             return messages
-        indexes = [index for index, message in enumerate(messages) if message.role == "user"]
+        indexes = [index for index, message in enumerate(messages) if message.role == "user" and not message.metadata.get("external_context")]
         return messages if len(indexes) <= self.recent_turns else messages[indexes[-self.recent_turns] :]
 
     def estimate_tokens(self, messages: list[CanonicalMessage]) -> int:

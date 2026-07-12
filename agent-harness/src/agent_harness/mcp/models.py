@@ -39,6 +39,13 @@ class MCPServerStatus(StrEnum):
     STOPPED = "stopped"
 
 
+class MCPServerHealth(StrEnum):
+    """Catalog health independent from transport availability."""
+
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+
+
 @dataclass(frozen=True, slots=True)
 class MCPServerConfig:
     """Validated immutable definition for one MCP server."""
@@ -124,3 +131,6 @@ class MCPServerSnapshot:
     instructions_chars: int = 0
     credential_identity_hash: str | None = None
     canonical_tool_mapping: tuple[dict[str, str], ...] = ()
+    health: MCPServerHealth = MCPServerHealth.HEALTHY
+    catalog_stale: bool = False
+    generation: int = 0

@@ -11,6 +11,7 @@ from agent_harness.security.models import SandboxMode, SandboxPolicy
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows WSL2 integration test")
+@pytest.mark.platform_windows
 async def test_wsl_bubblewrap_read_only_boundary(tmp_path: Path):
     """Verify a real WSL2 bubblewrap backend blocks workspace writes when installed."""
     backend = WslBubblewrapSandboxBackend()

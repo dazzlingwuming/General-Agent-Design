@@ -53,6 +53,8 @@ from agent_harness.mcp.runtime import MCPRuntime
 from agent_harness.mcp.approval import MCPLaunchApprovalStore
 from agent_harness.config import default_user_config_path
 from agent_harness.security.approval import ConsoleApprovalHandler
+from agent_harness.security.approval_grants import ApprovalGrantStore
+from agent_harness.artifacts.store import ArtifactStore
 
 
 class SubsystemInitState(StrEnum):
@@ -83,6 +85,9 @@ class RunManager:
     trust_context: ProjectTrustContext | None = None
     mcp_runtime: MCPRuntime | None = None
     current_thread_id: str | None = None
+    approval_grants: ApprovalGrantStore = field(default_factory=ApprovalGrantStore)
+    artifact_store: ArtifactStore | None = None
+    turn_steer_mailbox: list[str] = field(default_factory=list)
 
     async def run(self, task: str, workspace: Path) -> RunState:
         """Create a run state, wire dependencies, execute the loop, and save summary."""
@@ -103,6 +108,7 @@ class RunManager:
         root = state.workspace_root.resolve()
         paths = self.project_paths or resolve_project_paths(root, root)
         trace = JsonlTraceSink(state.run_id, trace_root, fail_on_write_error=self.config.trace.fail_on_write_error)
+        self.ensure_artifact_store((trace_root / state.run_id / "artifacts").resolve())
         trace.emit(
             "run.created" if state.turn_count <= 1 else "turn.created",
             payload={"task": state.task, "workspace_root": str(root), "turn_id": state.turn_id, "turn_count": state.turn_count},
@@ -133,6 +139,7 @@ class RunManager:
             trace=trace,
             agent_registry=agent_registry,
             mcp_runtime=self.mcp_runtime,
+            artifact_store=self.artifact_store,
             max_concurrent=self.config.subagents.max_concurrent,
             max_total=self.config.subagents.max_total,
             max_depth=self.config.subagents.max_depth,
@@ -200,6 +207,8 @@ class RunManager:
                 workspace_root=root,
                 sandbox_policy_factory=lambda principal: policy,
                 audit=lambda event, payload: self._emit_security_audit(trace, event, payload),
+                approval_grants=self.approval_grants,
+                artifact_store=self.artifact_store,
             ),
             trace=trace,
             final_guard=lambda: (
@@ -211,6 +220,7 @@ class RunManager:
             approval_policy=security.approval_policy,
             enabled_tools_provider=lambda tools: self._effective_tools(state.turn_id or "turn_unknown", tools),
             tool_success_callback=lambda name, arguments: self._update_working_set(root, name, arguments),
+            mailbox_provider=self._drain_turn_steer_mailbox,
         )
         try:
             if invocation_service:
@@ -222,6 +232,7 @@ class RunManager:
                         state.messages.append(CanonicalMessage(role="user", content=f"Skill 子 Agent 结构化结果：\n{json.dumps(result.delegated_result, ensure_ascii=False)}"))
             return await loop.run(state)
         finally:
+            self.approval_grants.clear_turn(state.run_id, state.turn_id or "turn_unknown")
             self.skill_executions.finish_turn(state.turn_id or "turn_unknown")
             if self.mcp_runtime:
                 self.mcp_runtime.finish_turn(state.turn_id or "turn_unknown")
@@ -230,6 +241,20 @@ class RunManager:
             state.agent_summary = scheduler.summary()
             write_result_summary(state, trace.run_dir, trace.path)
             trace.close()
+
+    def ensure_artifact_store(self, artifact_root: Path) -> ArtifactStore:
+        """Create or reuse the thread-owned ArtifactStore at the configured trace path."""
+        resolved = artifact_root.resolve()
+        if self.artifact_store is None or self.artifact_store.root != resolved:
+            limits = self.config.artifacts
+            self.artifact_store = ArtifactStore(resolved, limits.max_encoded_bytes, limits.max_item_bytes, limits.max_turn_bytes, limits.max_thread_bytes)
+        return self.artifact_store
+
+    def _drain_turn_steer_mailbox(self) -> list[str]:
+        """Consume external context steers only between model/tool boundaries."""
+        messages = list(self.turn_steer_mailbox)
+        self.turn_steer_mailbox.clear()
+        return messages
 
     def initialize_project_context(self, thread_id: str, workspace: Path, *, trust_context: ProjectTrustContext | None = None, project_trusted: bool | None = None, resume: bool = False) -> None:
         """Discover and persist stable Guidance and Skill metadata for one thread runtime."""

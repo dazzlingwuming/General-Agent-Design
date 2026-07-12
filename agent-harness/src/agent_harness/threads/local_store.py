@@ -53,23 +53,26 @@ class LocalThreadStore:
         state = self._state_from_metadata(metadata)
         history = await self.load_history(thread_id)
         active_turn_id = _active_turn_from_history(history)
-        if active_turn_id:
-            item = RolloutItem.create(
-                "turn.interrupted",
-                session_id=state.session_id,
-                thread_id=state.thread_id,
-                turn_id=active_turn_id,
-                status=ItemStatus.INTERRUPTED,
-                payload={"reason": "recovered incomplete turn as interrupted"},
-            )
-            live = self._live_thread(state)
-            await live.append_items([item])
-            await live.flush()
-        state.status = ThreadStatus.IDLE
-        state.active_turn_id = None
         live = self._live_thread(state)
-        await live.update_metadata({})
-        return live
+        try:
+            if active_turn_id:
+                item = RolloutItem.create(
+                    "turn.interrupted",
+                    session_id=state.session_id,
+                    thread_id=state.thread_id,
+                    turn_id=active_turn_id,
+                    status=ItemStatus.INTERRUPTED,
+                    payload={"reason": "recovered incomplete turn as interrupted"},
+                )
+                await live.append_items([item])
+                await live.flush()
+            state.status = ThreadStatus.IDLE
+            state.active_turn_id = None
+            await live.update_metadata({})
+            return live
+        except BaseException:
+            await live.shutdown()
+            raise
 
     async def append_items(self, thread_id: str, items: list[RolloutItem]) -> None:
         """Append items to a thread by opening a short-lived live handle."""
@@ -163,6 +166,6 @@ def _active_turn_from_history(history: list[RolloutItem]) -> str | None:
     for item in history:
         if item.item_type == "turn.started":
             active = item.turn_id
-        if item.item_type in {"turn.completed", "turn.failed", "turn.interrupted"} and item.turn_id == active:
+        if item.item_type in {"turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"} and item.turn_id == active:
             active = None
     return active

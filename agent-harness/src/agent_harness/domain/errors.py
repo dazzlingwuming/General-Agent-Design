@@ -114,3 +114,10 @@ class CancellationError(HarnessError):
 class InternalInvariantError(HarnessError):
     code = "INTERNAL_INVARIANT"
     category = "internal"
+
+
+class ArtifactError(HarnessError):
+    """Reject unsafe, invalid, or over-quota artifact content."""
+
+    code = "ARTIFACT_ERROR"
+    category = "artifact"

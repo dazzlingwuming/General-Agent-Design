@@ -11,6 +11,7 @@ from agent_harness.security.models import SandboxMode, SandboxPolicy
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Native Linux bubblewrap integration test")
+@pytest.mark.platform_linux
 async def test_linux_bubblewrap_read_only_and_network_namespace(tmp_path: Path):
     """Verify native bubblewrap blocks workspace writes under a network-disabled policy."""
     backend = BubblewrapSandboxBackend()

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "agent-harness"
 version = "0.1.0"
-description = "Phase 1 single-agent harness runtime"
+description = "Local coding agent harness with threads, tools, subagents, skills, permissions, and MCP"
 requires-python = ">=3.11"
 dependencies = [
   "httpx>=0.27.0",
@@ -31,6 +31,12 @@ agent-harness = "agent_harness.cli:main"
 [tool.pytest.ini_options]
 markers = [
   "live: tests that call a real provider API",
+  "unit: deterministic tests without external services",
+  "integration_local: local process or protocol integration tests",
+  "platform_linux: tests requiring Linux platform capabilities",
+  "platform_windows: tests requiring Windows or WSL platform capabilities",
+  "live_provider: tests that call a real model provider",
+  "live_oauth: tests that require a real external OAuth provider",
 ]
 testpaths = ["tests"]
 norecursedirs = ["tests/fixtures"]

@@ -35,6 +35,16 @@ class MCPAdminPolicy:
     denied_tools: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class MCPAdminConfig:
+    """Tri-state result for absent, valid, or invalid machine-managed configuration."""
+
+    exists: bool
+    valid: bool
+    policy: MCPAdminPolicy = field(default_factory=MCPAdminPolicy)
+    servers: dict[str, Any] = field(default_factory=dict)
+
+
 class MCPConfigResolver:
     """Discover scoped MCP files and select complete same-name winners."""
 
@@ -55,8 +65,9 @@ class MCPConfigResolver:
         winners: dict[str, MCPServerConfig] = {}
         blocked: list[MCPServerConfig] = []
         diagnostics: list[str] = []
-        admin_policy, admin_rows = self._read_admin_config(diagnostics)
-        self._parse_rows(admin_rows, MCPConfigScope.ADMIN, winners, blocked, diagnostics)
+        admin = self._read_admin_config(diagnostics)
+        admin_policy = admin.policy
+        self._parse_rows(admin.servers, MCPConfigScope.ADMIN, winners, blocked, diagnostics)
         admin_names = set(winners)
         if inline_user_servers:
             self._parse_rows(inline_user_servers, MCPConfigScope.USER, winners, blocked, diagnostics, protected_names=admin_names)
@@ -71,6 +82,10 @@ class MCPConfigResolver:
                 self._parse_rows(rows, scope, winners, blocked, diagnostics, protected_names=admin_names)
             except (OSError, json.JSONDecodeError, MCPConfigurationError) as exc:
                 diagnostics.append(f"{path}: {exc}")
+        if admin.exists and not admin.valid:
+            blocked.extend(config for config in winners.values() if config not in blocked)
+            diagnostics.append("admin: invalid managed configuration; all MCP servers disabled")
+            return MCPResolvedConfig((), tuple(sorted(blocked, key=lambda item: item.name)), tuple(diagnostics), admin_policy)
         allowed: list[MCPServerConfig] = []
         for config in winners.values():
             reason = self._admin_denial(config, admin_policy)
@@ -97,11 +112,11 @@ class MCPConfigResolver:
             except (TypeError, ValueError, MCPConfigurationError) as exc:
                 diagnostics.append(f"{scope.value}:{name}: {exc}")
 
-    def _read_admin_config(self, diagnostics: list[str]) -> tuple[MCPAdminPolicy, dict[str, Any]]:
+    def _read_admin_config(self, diagnostics: list[str]) -> MCPAdminConfig:
         """Read one machine-managed policy and server map without accepting lower overrides."""
         path = self.admin_root / "mcp.json"
         if not path.is_file():
-            return MCPAdminPolicy(), {}
+            return MCPAdminConfig(False, True)
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
@@ -109,10 +124,20 @@ class MCPConfigResolver:
             policy = raw.get("policy", {})
             if not isinstance(policy, dict):
                 raise MCPConfigurationError("admin policy must be an object")
-            return MCPAdminPolicy(tuple(map(str, policy.get("disabledServers", []))), tuple(map(str, policy.get("allowedStdioCommands", []))), tuple(map(str, policy.get("allowedHttpDomains", []))), tuple(map(str, policy.get("deniedHttpDomains", []))), tuple(map(str, policy.get("deniedTools", [])))), dict(raw.get("mcpServers", {}))
-        except (OSError, json.JSONDecodeError, MCPConfigurationError) as exc:
-            diagnostics.append(f"{path}: {exc}")
-            return MCPAdminPolicy(), {}
+            rows = raw.get("mcpServers", {})
+            if not isinstance(rows, dict):
+                raise MCPConfigurationError("admin server map must be an object")
+            resolved_policy = MCPAdminPolicy(
+                _string_list(policy, "disabledServers"),
+                _string_list(policy, "allowedStdioCommands"),
+                _string_list(policy, "allowedHttpDomains"),
+                _string_list(policy, "deniedHttpDomains"),
+                _string_list(policy, "deniedTools"),
+            )
+            return MCPAdminConfig(True, True, resolved_policy, rows)
+        except (OSError, json.JSONDecodeError, MCPConfigurationError, TypeError, ValueError) as exc:
+            diagnostics.append(f"admin MCP configuration is invalid ({type(exc).__name__})")
+            return MCPAdminConfig(True, False)
 
     def _admin_denial(self, config: MCPServerConfig, policy: MCPAdminPolicy) -> str | None:
         """Return the first machine-policy denial for a resolved server."""
@@ -168,8 +193,8 @@ def parse_server_config(name: str, row: Any, scope: MCPConfigScope, project_root
         headers=tuple(sorted((str(key), str(value)) for key, value in headers.items())) if isinstance(headers, dict) else (),
         auth_mode=str(row.get("auth_mode", "none")),
         oauth_scopes=tuple(map(str, row.get("oauth_scopes", []))),
-        startup_timeout_seconds=float(row.get("startup_timeout_seconds", row.get("startup_timeout_sec", 10))),
-        tool_timeout_seconds=float(row.get("tool_timeout_seconds", row.get("tool_timeout_sec", 60))),
+        startup_timeout_seconds=_float_setting(row, "startup_timeout_seconds", "startup_timeout_sec", 10),
+        tool_timeout_seconds=_float_setting(row, "tool_timeout_seconds", "tool_timeout_sec", 60),
         cleanup_timeout_seconds=float(row.get("cleanup_timeout_seconds", 5)),
         enabled_tools=tuple(map(str, row.get("enabled_tools", []))),
         disabled_tools=tuple(map(str, row.get("disabled_tools", []))),
@@ -179,6 +204,20 @@ def parse_server_config(name: str, row: Any, scope: MCPConfigScope, project_root
         trusted=scope in {MCPConfigScope.ADMIN, MCPConfigScope.USER, MCPConfigScope.LOCAL},
         config_hash=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
     )
+
+
+def _float_setting(row: dict[Any, Any], primary: str, legacy: str, default: float) -> float:
+    """Read a numeric setting while treating explicit null as the documented default."""
+    value = row.get(primary, row.get(legacy, default))
+    return default if value is None else float(value)
+
+
+def _string_list(row: dict[str, Any], name: str) -> tuple[str, ...]:
+    """Validate one managed policy list without accepting strings as iterables."""
+    value = row.get(name, [])
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise MCPConfigurationError(f"admin policy {name} must be a string array")
+    return tuple(value)
 
 
 def forwarded_environment(config: MCPServerConfig) -> dict[str, str]:

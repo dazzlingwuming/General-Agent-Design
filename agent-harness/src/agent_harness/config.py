@@ -46,6 +46,8 @@ class ContextConfig:
     char_to_token_ratio: float = 4.0
     max_estimated_input_tokens: int = 120000
     recent_turns: int = 3
+    max_external_item_bytes: int = 100_000
+    max_external_turn_bytes: int = 300_000
 
 
 @dataclass(slots=True)
@@ -134,6 +136,16 @@ class MCPConfig:
 
 
 @dataclass(slots=True)
+class ArtifactConfig:
+    """Artifact validation, quota, and retention limits."""
+
+    max_encoded_bytes: int = 12_000_000
+    max_item_bytes: int = 8_000_000
+    max_turn_bytes: int = 20_000_000
+    max_thread_bytes: int = 100_000_000
+
+
+@dataclass(slots=True)
 class HarnessConfig:
     """Top-level configuration object shared by CLI and runtime code."""
 
@@ -148,6 +160,7 @@ class HarnessConfig:
     guidance: GuidanceConfig = field(default_factory=GuidanceConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
     mcp: MCPConfig = field(default_factory=MCPConfig)
+    artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
 
 
 MODEL_ALIASES = {
@@ -298,6 +311,13 @@ def load_config(path: Path | None = None) -> HarnessConfig:
         tool_disclosure=str(mcp_data.get("tool_disclosure", "auto")),
         servers=dict(_section(mcp_data, "servers")),
     )
+    artifact_data = _section(raw, "artifacts")
+    artifacts = ArtifactConfig(
+        max_encoded_bytes=int(artifact_data.get("max_encoded_bytes", 12_000_000)),
+        max_item_bytes=int(artifact_data.get("max_item_bytes", 8_000_000)),
+        max_turn_bytes=int(artifact_data.get("max_turn_bytes", 20_000_000)),
+        max_thread_bytes=int(artifact_data.get("max_thread_bytes", 100_000_000)),
+    )
     trace_data = _section(raw, "trace")
     trace = TraceConfig(
         directory=Path(trace_data.get("directory", ".harness/runs")),
@@ -313,7 +333,7 @@ def load_config(path: Path | None = None) -> HarnessConfig:
     if env_url := os.getenv("DEEPSEEK_API_URL"):
         provider.base_url = env_url
     provider.model = normalize_model_name(provider.model)
-    return HarnessConfig(provider, agent, run, tools, context, trace, subagents, security, guidance, skills, mcp)
+    return HarnessConfig(provider, agent, run, tools, context, trace, subagents, security, guidance, skills, mcp, artifacts)
 
 
 def _load_permission_rules(raw: dict[str, Any], *, is_user_config: bool, trusted_project: bool) -> list[PermissionRule]:

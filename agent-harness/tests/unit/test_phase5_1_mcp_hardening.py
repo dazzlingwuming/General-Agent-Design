@@ -16,7 +16,7 @@ from agent_harness.guidance.trust import TrustDecisionSource, WorkspaceTrustStat
 from agent_harness.mcp.config import MCPConfigResolver, parse_server_config
 from agent_harness.mcp.connection import MCPServerConnection
 from agent_harness.mcp.errors import MCPProtocolError, MCPToolExecutionError
-from agent_harness.mcp.models import MCPConfigScope, MCPServerStatus, MCPToolRecord
+from agent_harness.mcp.models import MCPConfigScope, MCPServerHealth, MCPServerStatus, MCPToolRecord
 from agent_harness.mcp.naming import canonical_tool_name
 from agent_harness.mcp.pagination import collect_paginated
 from agent_harness.mcp.runtime import MCPRuntime
@@ -102,13 +102,75 @@ async def test_read_operation_reinitializes_once_after_typed_http_404(tmp_path: 
             raise httpx.HTTPStatusError("expired session", request=request, response=response)
         return "recovered"
 
-    async def reinitialize(reason: str) -> None:
+    async def reinitialize(reason: str, _observed_generation: int) -> None:
         """Record the recovery reason without opening a real network transport."""
         reinitialized.append(reason)
 
     connection._reinitialize = reinitialize  # type: ignore[method-assign]
     assert await connection._execute_with_session_recovery(operation) == "recovered"
     assert (calls, reinitialized) == (2, ["session_not_found"])
+
+
+async def test_concurrent_reinitialize_uses_one_new_generation(tmp_path: Path) -> None:
+    """Let concurrent expired-session observers share one completed reconnect."""
+    config = parse_server_config("fixture", {"url": "https://example.com/mcp"}, MCPConfigScope.USER, tmp_path)
+    connection = MCPServerConnection(config, (tmp_path,))
+    connection.session = SimpleNamespace()  # type: ignore[assignment]
+    connection.status = MCPServerStatus.READY
+    connection._has_catalog_snapshot = True
+    connects = 0
+
+    async def close() -> None:
+        """Simulate closing the old generation."""
+        connection.session = None
+        connection.status = MCPServerStatus.STOPPED
+
+    async def connect() -> None:
+        """Create exactly one usable replacement generation."""
+        nonlocal connects
+        connects += 1
+        await asyncio.sleep(0)
+        connection.generation += 1
+        connection.session = SimpleNamespace()  # type: ignore[assignment]
+        connection.status = MCPServerStatus.READY
+
+    connection.close = close  # type: ignore[method-assign]
+    connection.connect = connect  # type: ignore[method-assign]
+    await asyncio.gather(connection._reinitialize("session_not_found", 0), connection._reinitialize("session_not_found", 0))
+    assert connects == 1
+    assert connection.generation == 1
+
+
+async def test_catalog_refresh_failure_preserves_last_good_snapshot(tmp_path: Path) -> None:
+    """Commit catalog candidates atomically and retain prior tools after refresh failure."""
+    config = parse_server_config("fixture", {"url": "https://example.com/mcp"}, MCPConfigScope.USER, tmp_path)
+    connection = MCPServerConnection(config, (tmp_path,))
+
+    class Session:
+        """Return one valid page before injecting a later transport failure."""
+
+        fail = False
+
+        async def list_tools(self, cursor: str | None = None) -> types.ListToolsResult:
+            """Return a deterministic tool page or fail the refresh."""
+            if self.fail:
+                raise OSError("catalog unavailable")
+            return types.ListToolsResult(tools=[types.Tool(name="read", description="read", inputSchema={"type": "object"})])
+
+    session = Session()
+    connection.session = session  # type: ignore[assignment]
+    connection.initialize_result = SimpleNamespace(capabilities=SimpleNamespace(tools=object(), resources=None, prompts=None))  # type: ignore[assignment]
+    connection.status = MCPServerStatus.CONNECTING
+    await connection.refresh_catalogs()
+    original = connection.tools
+    connection.status = MCPServerStatus.READY
+    session.fail = True
+    with pytest.raises(OSError, match="catalog unavailable"):
+        await connection.refresh_catalogs()
+    assert connection.tools is original
+    assert connection.health == MCPServerHealth.DEGRADED
+    assert connection.catalog_stale is True
+    assert connection.is_usable is True
 
 
 def test_approval_override_and_untrusted_writes_annotation(tmp_path: Path) -> None:
@@ -158,11 +220,29 @@ def test_admin_policy_cannot_be_overridden_and_denies_domains(tmp_path: Path) ->
     assert resolved.servers[0].disabled_tools == ("*delete*",)
 
 
+@pytest.mark.parametrize("admin_content", ["{truncated", json.dumps({"policy": "invalid"}), json.dumps({"policy": {"deniedTools": "*delete*"}})])
+def test_invalid_admin_config_fails_closed_without_secret_diagnostics(tmp_path: Path, admin_content: str) -> None:
+    """Disable lower-scope MCP servers whenever an existing managed file is invalid."""
+    admin = tmp_path / "admin"
+    user = tmp_path / "user"
+    project = tmp_path / "project"
+    admin.mkdir()
+    user.mkdir()
+    project.mkdir()
+    (admin / "mcp.json").write_text(admin_content, encoding="utf-8")
+    (user / "mcp.json").write_text(json.dumps({"mcpServers": {"user-server": {"url": "https://example.com/mcp", "headers": {"Authorization": "secret-token"}}}}), encoding="utf-8")
+    trust = resolve_project_trust(WorkspaceTrustState.TRUSTED, TrustDecisionSource.DEFAULT, guidance_requires_trust=True, skills_require_trust=True, mcp_requires_trust=True)
+    resolved = MCPConfigResolver(project, trust, user_root=user, admin_root=admin).resolve()
+    assert resolved.servers == ()
+    assert [item.name for item in resolved.blocked] == ["user-server"]
+    assert "secret-token" not in "\n".join(resolved.diagnostics)
+
+
 async def test_disclosure_is_turn_local_and_auto_uses_budget() -> None:
     """Expire searched tools after a turn and resolve AUTO from the schema budget."""
     runtime = MCPRuntime(SimpleNamespace(servers=(), blocked=(), diagnostics=()), (), disclosure_mode="auto", max_estimated_input_tokens=100, char_to_token_ratio=1, max_tool_context_ratio=0.1)
     record = MCPToolRecord("server", "large", canonical_tool_name("server", "large"), "x" * 100, {"type": "object", "description": "y" * 100})
-    connection = SimpleNamespace(tools=(record,), resources=(), prompts=(), status=MCPServerStatus.READY, config=SimpleNamespace(always_load_tools=False, default_approval_mode="inherit", tool_approval_overrides=(), trusted=True, tool_timeout_seconds=60, scope=MCPConfigScope.USER))
+    connection = SimpleNamespace(tools=(record,), resources=(), prompts=(), status=MCPServerStatus.READY, is_usable=True, config=SimpleNamespace(always_load_tools=False, default_approval_mode="inherit", tool_approval_overrides=(), trusted=True, tool_timeout_seconds=60, scope=MCPConfigScope.USER, url="https://example.com/mcp", command=None, args=()))
     runtime.manager.connections = {"server": connection}
     registry = ToolRegistry()
     runtime.register_tools(registry, turn_id_provider=lambda: "turn-1")

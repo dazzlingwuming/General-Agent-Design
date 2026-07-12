@@ -14,6 +14,7 @@ class ItemStatus(str, Enum):
     STARTED = "STARTED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
     INTERRUPTED = "INTERRUPTED"
 
 

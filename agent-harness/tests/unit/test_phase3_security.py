@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 
@@ -9,8 +9,9 @@ from agent_harness.domain.tools import ToolDefinition
 from agent_harness.sandbox.base import CommandResult
 from agent_harness.sandbox.fake import FakeSandboxBackend
 from agent_harness.sandbox.base import CommandExecution
-from agent_harness.sandbox.bubblewrap import WslBubblewrapSandboxBackend
-from agent_harness.security.approval import ApprovalDecision
+from agent_harness.sandbox.bubblewrap import WslBubblewrapSandboxBackend, windows_path_to_wsl
+from agent_harness.security.approval import ApprovalDecision, TurnCancellationRequested
+from agent_harness.security.approval_grants import ApprovalGrantStore
 from agent_harness.security.hooks import HookDecision, HookManager
 from agent_harness.security.models import (
     ApprovalPolicy,
@@ -87,6 +88,20 @@ class AllowOnceHandler:
         return ApprovalDecision.ALLOW_ONCE
 
 
+class FixedApprovalHandler:
+    """Return one configured decision while retaining sanitized requests."""
+
+    def __init__(self, decision: ApprovalDecision) -> None:
+        """Store the fixed decision and initialize the request log."""
+        self.decision = decision
+        self.requests = []
+
+    async def request(self, request):
+        """Record and return the configured approval decision."""
+        self.requests.append(request)
+        return self.decision
+
+
 async def test_approval_and_never_policy(tmp_path: Path):
     """Verify ASK prompts once while never policy rejects the same request."""
     registry = ToolRegistry()
@@ -98,6 +113,43 @@ async def test_approval_and_never_policy(tmp_path: Path):
     assert allowed.status == "success"
     assert len(handler.requests) == 1
     assert denied.error_code == "TOOL_AUTHORIZATION"
+
+
+async def test_thread_approval_is_shared_but_argument_scoped(tmp_path: Path):
+    """Reuse a thread grant across turns only for the same principal arguments."""
+    async def read_target(args: dict) -> str:
+        """Return the approved target path for the grant test."""
+        return str(args["path"])
+
+    registry = ToolRegistry()
+    registry.register(ToolDefinition("scoped", "desc", {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}, read_target, required_capabilities=frozenset()))
+    grants = ApprovalGrantStore()
+    allow = FixedApprovalHandler(ApprovalDecision.ALLOW_THREAD)
+    engine = PermissionEngine([PermissionRule("ask", PermissionDecision.ASK, tool="scoped")])
+    first = ToolRuntime(registry, permission_engine=engine, approval_handler=allow, approval_grants=grants, workspace_root=tmp_path)
+    principal_one = make_principal("scoped", capabilities=frozenset())
+    assert (await first.execute(ToolCall("one", "scoped", {"path": "a.txt"}), principal_one)).status == "success"
+    deny = FixedApprovalHandler(ApprovalDecision.DENY_ONCE)
+    second = ToolRuntime(registry, permission_engine=engine, approval_handler=deny, approval_grants=grants, workspace_root=tmp_path)
+    principal_two = ToolExecutionPrincipal("thread", "thread", "turn-2", "agent", allowed_tools=frozenset({"scoped"}), capabilities=frozenset())
+    assert (await second.execute(ToolCall("two", "scoped", {"path": "a.txt"}), principal_two)).status == "success"
+    denied = await second.execute(ToolCall("three", "scoped", {"path": "b.txt"}), principal_two)
+    assert denied.error_code == "TOOL_AUTHORIZATION"
+    assert len(allow.requests) == 1
+    assert len(deny.requests) == 1
+
+
+async def test_cancel_turn_is_control_flow_and_approval_preview_redacts_secrets(tmp_path: Path):
+    """Propagate cancel-turn while preventing secret-shaped arguments from display."""
+    registry = ToolRegistry()
+    registry.register(ToolDefinition("danger", "desc", {"type": "object", "properties": {"api_key": {"type": "string"}, "args": {"type": "array"}}}, noop, required_capabilities=frozenset()))
+    handler = FixedApprovalHandler(ApprovalDecision.CANCEL_TURN)
+    runtime = ToolRuntime(registry, permission_engine=PermissionEngine([PermissionRule("ask", PermissionDecision.ASK, tool="danger")]), approval_handler=handler, workspace_root=tmp_path)
+    with pytest.raises(TurnCancellationRequested):
+        await runtime.execute(ToolCall("cancel", "danger", {"api_key": "secret-value", "args": ["--token", "secret-token"]}), make_principal("danger", capabilities=frozenset()))
+    request = handler.requests[0]
+    assert request.argument_preview["api_key"] == "[REDACTED]"
+    assert request.argument_preview["args"] == ["--token", "[REDACTED]"]
 
 
 async def test_hook_cannot_override_rule_deny(tmp_path: Path):
@@ -128,12 +180,17 @@ async def test_structured_command_uses_fake_sandbox_and_rejects_shell(tmp_path: 
     assert bad.error_code == "TOOL_INPUT_VALIDATION"
 
 
+def test_windows_path_to_wsl_is_host_independent():
+    """Verify Windows path translation has the same result on every host OS."""
+    assert windows_path_to_wsl(PureWindowsPath("C:/repo/work tree")) == PurePosixPath("/mnt/c/repo/work tree")
+
+
 def test_wsl_argv_keeps_posix_paths_and_linux_path(tmp_path: Path):
-    """Verify Windows-to-WSL compilation does not resolve POSIX paths on the host."""
+    """Verify WSL argv compilation preserves already translated POSIX paths."""
     backend = WslBubblewrapSandboxBackend()
     policy = make_policy(tmp_path)
     execution = CommandExecution("pytest", ("-q",), tmp_path)
-    workspace = backend._wsl_path(tmp_path)
+    workspace = "/mnt/c/repo"
     argv = backend._build_wsl_argv(execution, policy, workspace, workspace)
     assert workspace in argv
     assert "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" in argv

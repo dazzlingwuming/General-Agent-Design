@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable
@@ -93,6 +94,8 @@ class MCPRuntime:
 
         server = self.manager.connections[record.server_name].config
         approval = MCPApprovalResolver().resolve(server, record)
+        identity = server.url or " ".join([server.command or "", *server.args])
+        approval_source = "tool_override" if record.remote_name in dict(server.tool_approval_overrides) else "server_default"
         return ToolDefinition(
             record.canonical_name,
             f"[{record.server_name}] {record.description}",
@@ -108,7 +111,7 @@ class MCPRuntime:
             ),
             side_effect=SideEffectType.EXTERNAL,
             required_capabilities=frozenset({Capability.MCP_TOOL_CALL, Capability.NETWORK_ACCESS, Capability.EXTERNAL_SIDE_EFFECT}),
-            metadata={"mcp_server": record.server_name, "mcp_remote_tool": record.remote_name, "mcp_approval_mode": approval.mode.value, "mcp_approval_decision": approval.decision.value if approval.decision else None, "mcp_annotations": record.annotations, "mcp_annotation_trusted": server.trusted},
+            metadata={"mcp_server": record.server_name, "mcp_scope": server.scope.value, "mcp_identity_summary": hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16], "mcp_remote_tool": record.remote_name, "mcp_approval_mode": approval.mode.value, "mcp_approval_source": approval_source, "mcp_approval_decision": approval.decision.value if approval.decision else None, "mcp_annotations": record.annotations, "mcp_annotation_trusted": server.trusted},
         )
 
     def _search_tool(self, turn_id_provider: Callable[[], str]) -> ToolDefinition:

@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import webbrowser
 import hashlib
+import json
+import time
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse, urlunparse
+from collections.abc import Awaitable, Callable
 
 import keyring
 from mcp.client.auth import OAuthClientProvider, TokenStorage
@@ -54,11 +57,26 @@ class KeyringTokenStorage(TokenStorage):
     async def get_tokens(self) -> OAuthToken | None:
         """Read and validate an OAuth token record from the OS credential store."""
         raw = await asyncio.to_thread(keyring.get_password, self.service, "tokens")
-        return OAuthToken.model_validate_json(raw) if raw else None
+        if not raw:
+            return None
+        payload = json.loads(raw)
+        return OAuthToken.model_validate(payload.get("tokens", payload))
 
     async def set_tokens(self, tokens: OAuthToken) -> None:
         """Persist refreshed OAuth tokens in the OS credential store."""
-        await asyncio.to_thread(keyring.set_password, self.service, "tokens", tokens.model_dump_json(exclude_none=True))
+        payload = {"tokens": tokens.model_dump(mode="json", exclude_none=True), "stored_at": time.time()}
+        await asyncio.to_thread(keyring.set_password, self.service, "tokens", json.dumps(payload, separators=(",", ":")))
+
+    async def get_token_expiry_time(self) -> float | None:
+        """Recover absolute expiry from the persisted issue time and expires_in value."""
+        raw = await asyncio.to_thread(keyring.get_password, self.service, "tokens")
+        if not raw:
+            return None
+        payload = json.loads(raw)
+        if not isinstance(payload, dict) or "tokens" not in payload or "stored_at" not in payload:
+            return None
+        expires_in = payload["tokens"].get("expires_in") if isinstance(payload["tokens"], dict) else None
+        return float(payload["stored_at"]) + int(expires_in) if expires_in is not None else None
 
     async def get_client_info(self) -> OAuthClientInformationFull | None:
         """Read dynamic client registration metadata from the credential store."""
@@ -80,6 +98,18 @@ class KeyringTokenStorage(TokenStorage):
 
 def create_oauth_provider(config: MCPServerConfig) -> OAuthClientProvider:
     """Create the official SDK OAuth 2.1 provider, which performs PKCE and discovery."""
+    return build_oauth_provider(config, KeyringTokenStorage(credential_identity(config)), _open_authorization_url, _read_authorization_callback)
+
+
+def build_oauth_provider(
+    config: MCPServerConfig,
+    storage: TokenStorage,
+    redirect_handler: Callable[[str], Awaitable[None]],
+    callback_handler: Callable[[], Awaitable[tuple[str, str | None]]],
+    *,
+    timeout: float = 300,
+) -> OAuthClientProvider:
+    """Build the official provider with injectable deterministic OAuth I/O boundaries."""
     if not config.url:
         raise ValueError("OAuth requires an HTTP MCP server URL")
     redirect_uri = AnyUrl("http://127.0.0.1:3030/callback")
@@ -91,14 +121,25 @@ def create_oauth_provider(config: MCPServerConfig) -> OAuthClientProvider:
         token_endpoint_auth_method="none",
         scope=" ".join(config.oauth_scopes) or None,
     )
-    return OAuthClientProvider(
+    return HarnessOAuthClientProvider(
         config.url,
         metadata,
-        KeyringTokenStorage(credential_identity(config)),
-        redirect_handler=_open_authorization_url,
-        callback_handler=_read_authorization_callback,
-        timeout=300,
+        storage,
+        redirect_handler=redirect_handler,
+        callback_handler=callback_handler,
+        timeout=timeout,
     )
+
+
+class HarnessOAuthClientProvider(OAuthClientProvider):
+    """Restore persisted absolute token expiry missing from the SDK TokenStorage contract."""
+
+    async def _initialize(self) -> None:
+        """Load SDK state and recover expiry when the storage exposes issue-time metadata."""
+        await super()._initialize()
+        getter = getattr(self.context.storage, "get_token_expiry_time", None)
+        if getter is not None:
+            self.context.token_expiry_time = await getter()
 
 
 async def _open_authorization_url(url: str) -> None:

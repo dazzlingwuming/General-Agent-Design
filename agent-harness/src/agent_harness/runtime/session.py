@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from agent_harness.config import HarnessConfig
 from agent_harness.domain.messages import CanonicalMessage
+from agent_harness.domain.errors import RunError
 from agent_harness.domain.run import RunState, RunStatus
 from agent_harness.rollout.items import ItemStatus, RolloutItem
 from agent_harness.runtime.run_manager import RunManager
@@ -13,7 +17,9 @@ from agent_harness.threads.local_store import LocalThreadStore
 from agent_harness.tracing.jsonl import JsonlTraceSink
 from agent_harness.tracing.summary import write_result_summary
 from agent_harness.turns.state import InputItem, ThreadStatus
-from agent_harness.utils.serialization import to_jsonable
+from agent_harness.turns.controller import TurnController
+from agent_harness.context.external import ExternalContextItem
+from agent_harness.artifacts.store import ArtifactSource
 from agent_harness.project.roots import resolve_project_paths
 from agent_harness.skills.invocation import SkillInvocationRequest, SkillInvocationSource
 from agent_harness.guidance.trust import ProjectTrustContext, TrustDecisionSource, WorkspaceTrustState, resolve_project_trust
@@ -32,6 +38,8 @@ class ConversationSession:
     store: LocalThreadStore = field(init=False)
     project_trusted: bool = False
     trust_context: ProjectTrustContext | None = None
+    pending_external_context: list[ExternalContextItem] = field(default_factory=list)
+    external_context_hashes: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         """Initialize the local thread store used by this conversation wrapper."""
@@ -88,7 +96,9 @@ class ConversationSession:
         self.state = RunState(task="", workspace_root=live.state.workspace_root)
         self.state.run_id = live.state.thread_id
         self.state.turn_count = live.state.turn_count
-        self.state.messages.extend(_messages_from_history(await self.store.load_history(thread_id)))
+        history = await self.store.load_history(thread_id)
+        self.state.messages.extend(_messages_from_history(history))
+        self._restore_external_context(history)
         self.manager.rollout_audit = lambda event, payload: self._record_audit_item(event, None, payload)
         resume_cwd = live.state.cwd or live.state.workspace_root
         self.manager.project_paths = resolve_project_paths(resume_cwd, live.state.workspace_root)
@@ -107,8 +117,6 @@ class ConversationSession:
         self._queue_explicit_skill(user_input, turn_id)
         input_item = InputItem(text=user_input)
         self.live_thread.state.turn_count += 1
-        self.live_thread.state.active_turn_id = turn_id
-        self.live_thread.state.status = ThreadStatus.ACTIVE
         self.state.turn_count = self.live_thread.state.turn_count
         self.state.turn_id = turn_id
         self.state.task = user_input
@@ -119,47 +127,29 @@ class ConversationSession:
         self.state.tool_call_count = 0
         self.state.status = RunStatus.CREATED
         self.state.messages.append(CanonicalMessage(role="user", content=user_input))
-        await self.live_thread.update_metadata({"status": ThreadStatus.ACTIVE, "active_turn_id": turn_id})
-        await self.live_thread.append_items(
-            [
-                self._item("turn.started", turn_id, payload={"turn_number": self.live_thread.state.turn_count}),
-                self._item("user_message", turn_id, payload={"text": input_item.text, "input_kind": input_item.input_kind}),
-            ]
-        )
+        await self._inject_pending_external_context(turn_id)
+        controller = TurnController(self.live_thread, turn_id, self._item, self._write_turn_summary)
+        await controller.start(input_item.text, self.live_thread.state.turn_count)
         self.manager.rollout_audit = lambda event, payload: self._record_audit_item(event, turn_id, payload)
         try:
             state = await self.manager.run_existing(self.state, self.config.trace.thread_directory)
+        except asyncio.CancelledError:
+            await controller.cancel_shielded(self.state, "Turn execution cancelled")
+            raise
+        except Exception as exc:
+            self.state.status = RunStatus.FAILED
+            if self.state.error is None:
+                self.state.error = RunError(code="TURN_FAILED", message=str(exc), category="runtime", recoverable=False, cause_type=type(exc).__name__)
+            await controller.fail(self.state)
+            raise
         finally:
             self.manager.rollout_audit = None
-        terminal_item = "turn.completed" if state.status == RunStatus.COMPLETED else "turn.failed"
-        terminal_status = ItemStatus.COMPLETED if state.status == RunStatus.COMPLETED else ItemStatus.FAILED
-        self.live_thread.state.status = ThreadStatus.IDLE
-        self.live_thread.state.active_turn_id = None
-        await self.live_thread.append_items(
-            [
-                self._item(
-                    "agent_message",
-                    turn_id,
-                    payload={"text": state.final_output, "status": state.status.value, "error": to_jsonable(state.error)},
-                ),
-                self._item(
-                    terminal_item,
-                    turn_id,
-                    status=terminal_status,
-                    payload={
-                        "final_output": state.final_output,
-                        "error": to_jsonable(state.error),
-                        "iteration": state.iteration,
-                        "model_call_count": state.model_call_count,
-                        "tool_call_count": state.tool_call_count,
-                        "usage": to_jsonable(state.usage_total),
-                    },
-                ),
-            ]
-        )
-        await self.live_thread.update_metadata({"status": ThreadStatus.IDLE, "active_turn_id": None})
-        await self.live_thread.flush()
-        self._write_turn_summary(state)
+        if state.status == RunStatus.COMPLETED:
+            await controller.complete(state)
+        elif state.status == RunStatus.CANCELLED:
+            await controller.cancel(state, "Turn execution cancelled")
+        else:
+            await controller.fail(state)
         return state
 
     async def close(self) -> None:
@@ -230,6 +220,84 @@ class ConversationSession:
         self.manager.pending_skill_invocations.append(
             SkillInvocationRequest(token, arguments.strip(), SkillInvocationSource.USER_EXPLICIT, self.thread_id or "", turn_id)
         )
+
+    async def queue_external_context(self, source_kind: str, server_name: str, source_name: str, payload: dict, mime_type: str | None = None) -> ExternalContextItem | None:
+        """Deduplicate and queue user-selected MCP content for the next safe model boundary."""
+        await self._ensure_started()
+        assert self.live_thread is not None
+        assert self.thread_id is not None
+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)
+        encoded = serialized.encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        if digest in self.external_context_hashes:
+            return None
+        artifact_id: str | None = None
+        content = serialized
+        if len(encoded) > self.config.context.max_external_item_bytes:
+            store = self.manager.ensure_artifact_store(self.thread_dir / "artifacts")
+            reference = await store.put_text(serialized, "application/json", ArtifactSource(self.thread_id, self.live_thread.state.active_turn_id or "pending", server_name, source_name))
+            artifact_id = reference.artifact_id
+            content = f"外部内容超过上下文单项限制，已保存为 Artifact {reference.artifact_id}，SHA-256={reference.sha256}，大小={reference.size_bytes} 字节。"
+        item = ExternalContextItem(source_kind, server_name, source_name, mime_type, digest, "external_untrusted_user_selected", len(encoded), content, artifact_id)  # type: ignore[arg-type]
+        self.external_context_hashes.add(digest)
+        if self.live_thread.state.status == ThreadStatus.ACTIVE:
+            self.manager.turn_steer_mailbox.append(item.render())
+            destination = "active_turn_mailbox"
+        else:
+            self.pending_external_context.append(item)
+            destination = "next_turn"
+        await self.live_thread.append_items([self._item("external_context.selected", self.live_thread.state.active_turn_id, payload={"source_kind": source_kind, "server": server_name, "source": source_name, "sha256": digest, "size_bytes": len(encoded), "mime_type": mime_type, "artifact_id": artifact_id, "content": content, "trust_label": item.trust_label, "destination": destination})])
+        await self.live_thread.flush()
+        return item
+
+    async def _inject_pending_external_context(self, turn_id: str) -> None:
+        """Append bounded pending external items after the user's initial turn message."""
+        assert self.state is not None
+        assert self.live_thread is not None
+        total = 0
+        injected: list[RolloutItem] = []
+        remaining: list[ExternalContextItem] = []
+        for item in self.pending_external_context:
+            context_cost = len(item.content.encode("utf-8")) if item.artifact_id else item.size_bytes
+            if total + context_cost > self.config.context.max_external_turn_bytes:
+                remaining.append(item)
+                continue
+            total += context_cost
+            self.state.messages.append(CanonicalMessage(role="user", content=item.render(), metadata={"external_context": True, "trust": item.trust_label, "sha256": item.content_hash}))
+            injected.append(self._item("external_context.injected", turn_id, payload={"source_kind": item.source_kind, "server": item.server_name, "source": item.source_name, "sha256": item.content_hash, "size_bytes": item.size_bytes, "artifact_id": item.artifact_id}))
+        self.pending_external_context = remaining
+        if injected:
+            await self.live_thread.append_items(injected)
+
+    def _restore_external_context(self, history: list[RolloutItem]) -> None:
+        """Rebuild pending and dedup state from selected/injected rollout provenance."""
+        injected = {str(item.payload.get("sha256")) for item in history if item.item_type == "external_context.injected"}
+        for rollout_item in history:
+            if rollout_item.item_type != "external_context.selected":
+                continue
+            payload = rollout_item.payload
+            digest = str(payload.get("sha256") or "")
+            if not digest:
+                continue
+            self.external_context_hashes.add(digest)
+            if digest in injected:
+                continue
+            source_kind = str(payload.get("source_kind"))
+            if source_kind not in {"mcp_resource", "mcp_prompt"}:
+                continue
+            self.pending_external_context.append(
+                ExternalContextItem(
+                    source_kind,  # type: ignore[arg-type]
+                    str(payload.get("server") or ""),
+                    str(payload.get("source") or ""),
+                    str(payload["mime_type"]) if payload.get("mime_type") else None,
+                    digest,
+                    str(payload.get("trust_label") or "external_untrusted_user_selected"),
+                    int(payload.get("size_bytes") or 0),
+                    str(payload.get("content") or ""),
+                    str(payload["artifact_id"]) if payload.get("artifact_id") else None,
+                )
+            )
 
 
 def _messages_from_history(history: list[RolloutItem]) -> list[CanonicalMessage]:

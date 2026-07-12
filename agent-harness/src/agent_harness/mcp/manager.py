@@ -21,7 +21,7 @@ class MCPServerManager:
     @property
     def active_servers(self) -> dict[str, MCPServerConnection]:
         """Return only successfully initialized connections."""
-        return {name: item for name, item in self.connections.items() if item.status == MCPServerStatus.READY}
+        return {name: item for name, item in self.connections.items() if item.is_usable}
 
     @property
     def failed_servers(self) -> dict[str, MCPServerConnection]:

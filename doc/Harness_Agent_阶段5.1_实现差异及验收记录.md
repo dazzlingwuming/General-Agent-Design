@@ -71,49 +71,60 @@ outputSchema 在 Connection 对原始 `structuredContent` 校验。ToolDefinitio
 
 ### 2.5 Artifact 范围
 
-当前 Artifact 接在 ToolRuntime 的 MCP adapter 输出边界，文本/JSON 大结果不会静默丢失。Image/Audio 仍仅以协议归一化引用保留，尚未将 base64 二进制拆分成独立二进制 Artifact。
+后续加固已将 ArtifactStore 提升为 Thread 级依赖，由配置的 `trace.thread_directory / thread_id / artifacts` 创建并注入 Root/Child ToolRuntime。文本、JSON、Image 和 Audio 均支持 host 文件名、SHA-256 去重、原子写、MIME allowlist/magic sniff、encoded/decoded/Turn/Thread quota 和显式 cleanup。
 
-## 3. 尚未完成或尚未达到正式验收
+### 2.6 SDK 1.28.1 的真实 404 表达
 
-以下项目不得标记为阶段 5.1 已正式完成：
+真实故障注入测试证明，Streamable HTTP transport 收到 404 后，SDK 向 ClientSession 暴露的是精确 `McpError: Session terminated`，异常链没有 `httpx.Response`。Host 因此在 typed status 检查之后兼容该 SDK 精确错误，不使用宽泛 session 字符串匹配。
 
-1. **真实 HTTP Session 404 Integration Test**：已覆盖 typed `httpx` 404 的恢复单元测试，但真实 FastMCP fixture 尚不能主动清除 SDK Session 后返回 404，因此没有完成“真实 Server 清 Session”的端到端验收。
-2. **真实多页 MCP Server Integration Test**：分页器覆盖多页、重复 cursor；尚未用真实协议进程返回 Tools/Resources/Templates/Prompts 多页数据。
-3. **OAuth 外部联调**：Identity、Keyring 隔离、login/logout 路径已实现；未使用真实 OAuth MCP 账户完成浏览器授权、refresh 和 logout 联调。
-4. **Resource/Prompt 进入当前 Turn**：CLI 可显式读取并显示，但内容尚未自动封装为“User-selected external context”提交到下一模型 Turn；当前实现不会错误注入 System。
-5. **Approval UI 完整字段**：Permission metadata 已包含 server、remote tool、mode、annotations 和 trust；终端审批界面尚未完整显示 arguments、annotation trust 和 effective mode。
-6. **二进制 Artifact**：混合结果不丢失，但 Image/Audio 的独立文件落盘、MIME 扩展名和单项大小限制尚未实现。
-7. **Artifact 总量限制与清理策略**：当前有 host 文件名和 thread 路径隔离，但没有 thread 总容量配额及淘汰策略。
-8. **Subagent 端到端模型测试**：显式子集注册和共享 Connection 已实现，尚未用真实模型验证 Child 实际调用、Principal trace attribution 和 Parent permission ceiling 的完整矩阵。
-9. **BM25 Tool Search**：仍使用稳定排序的 name/description substring；没有实现文档建议的 BM25。
-10. **GitHub Actions**：本地质量门通过，但本轮尚未 push，不能声称 GitHub Actions 已真实成功。
-11. **旧 SSE、Sampling、Elicitation、Tasks、Apps、Resource Subscription、跨进程 HTTP Session 恢复**：按设计明确延期。
+### 2.7 SDK Resource Template 分页注册
 
-因此本轮准确状态是：
+SDK low-level `list_resource_templates()` decorator 在 1.28.1 中只接受完整 list。真实分页 fixture 使用同一 SDK `request_handlers` 注册点返回标准 `ListResourceTemplatesResult(nextCursor=...)`；客户端仍经过官方 stdio/HTTP codec，未自行实现 JSON-RPC。
 
-> 阶段 5.1 的核心运行时加固和主要 P1 功能已落地；本地单元、真实 stdio、真实 Streamable HTTP 基础回归通过。由于真实 404/多页/OAuth、二进制 Artifact 和部分交互验收仍缺失，阶段 5 尚不能按原文的“全部验收项完成”标准标记为正式完成。
+## 3. 后续加固已完成
 
-## 4. 本地验收结果
+1. ASGI middleware 通过真实 Streamable HTTP 注入 session 404；Resource/Prompt 只重试一次，Tool call 不重放并返回 outcome unknown。
+2. Low-level MCP Server 通过真实 stdio/HTTP 为 Tools、Resources、Templates、Prompts 各返回 5 项、每页 2 项 opaque cursor。
+3. 本地 OAuth Server 覆盖 PRM/OASM、dynamic registration、PKCE、authorization code、refresh、invalid_grant、logout 和 identity 隔离。
+4. Resource/Prompt CLI 选择会形成 external/untrusted user context；支持 next Turn、active mailbox、hash 去重、resume 和 Artifact 回退。
+5. Approval UI 显示 scope、identity hash、remote/canonical tool、mode/source、side effect、annotation trust、principal 和脱敏参数。
+6. Binary Artifact、三层 quota、去重、原子写和 cleanup 已完成。
+7. Scripted Child Provider 固定调用 MCP，验证显式子集、共享 Connection 和 child principal trace attribution；不以真实模型随机行为作为门禁。
+8. Connection transport 改为 owner task，同一 task 进入/退出 SDK AnyIO context；并发 404 使用 generation single-flight。
+
+## 4. 仍明确延期
+
+- Native Windows Restricted Token/ACL/Job Object、WSL 沙箱完善；
+- SSE、Sampling、Elicitation、Tasks、Apps、Resource Subscription；
+- 跨进程恢复旧 HTTP MCP session id；
+- BM25（当前规模继续使用稳定 substring，按指标触发升级）；
+- 外部 OAuth provider 和真实 DeepSeek 的手动 smoke。它们不能代替本地确定性门禁。
+
+## 5. 最新本地验收结果
 
 ```text
 Ruff:       passed
-Mypy:       passed (109 source files)
-Pytest:     96 passed, 4 skipped
-stdio:      real official-SDK integration passed
-HTTP:       real Streamable HTTP basic integration passed
-compileall: passed
-diff check: passed（未暂存实现改动）
+Mypy:       passed (114 source files)
+Pytest core: 119 passed, 1 skipped, 3 deselected
+stdio:      real official-SDK lifecycle and pagination passed
+HTTP:       real Streamable HTTP lifecycle, 404 recovery, no-replay and pagination passed
+OAuth:      local loopback PKCE/refresh/invalid_grant/logout passed
+diff check: passed
 ```
 
 新增针对性覆盖包括：
 
-- Catalog 多页收集和 cursor loop；
-- typed HTTP 404 读操作恢复；
+- Catalog helper 与真实 stdio/HTTP 多页；
+- typed HTTP 404 与真实 SDK Session 404；
 - Tool isError 分类并保持 READY；
 - Tool call cancellation 传播；
 - Approval override 和 untrusted annotation；
 - Turn-local disclosure 和 AUTO 预算；
 - JSON Schema `$ref`、`oneOf`、`pattern`、`format`；
-- OAuth 同名不同 URI 隔离；
+- OAuth PKCE、refresh、invalid_grant、logout 与 identity 隔离；
 - Canonical name 标点、Unicode 碰撞；
-- Admin winner、domain deny 和 tool pattern deny。
+- Admin winner、invalid fail-closed、domain deny 和 tool pattern deny；
+- TurnController cancellation、ApprovalGrantStore、Rollout sticky failure；
+- External Context pending/active/resume；
+- Artifact MIME/quota/dedup/cleanup；
+- deterministic Subagent MCP principal attribution。

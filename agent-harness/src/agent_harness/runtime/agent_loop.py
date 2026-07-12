@@ -35,6 +35,9 @@ class AgentLoop:
     depth: int = 0
     enabled_tools_provider: Callable[[list[str]], list[str]] | None = None
     tool_success_callback: Callable[[str, dict], None] | None = None
+    principal_session_id: str | None = None
+    principal_thread_id: str | None = None
+    principal_agent_id: str | None = None
 
     async def run(self, state: RunState) -> RunState:
         """Drive the single-agent model/tool loop until completion or failure."""
@@ -200,10 +203,10 @@ class AgentLoop:
         if any(name.startswith("mcp__") for name in self.agent.enabled_tools):
             capabilities.update({Capability.MCP_TOOL_CALL, Capability.NETWORK_ACCESS, Capability.EXTERNAL_SIDE_EFFECT})
         return ToolExecutionPrincipal(
-            session_id=state.run_id,
-            thread_id=state.run_id,
+            session_id=self.principal_session_id or state.run_id,
+            thread_id=self.principal_thread_id or state.run_id,
             turn_id=state.turn_id or "turn_unknown",
-            agent_id=self.agent.name,
+            agent_id=self.principal_agent_id or self.agent.name,
             parent_agent_id=self.parent_agent_id,
             depth=self.depth,
             allowed_tools=frozenset(self.enabled_tools_provider(self.agent.enabled_tools) if self.enabled_tools_provider else self.agent.enabled_tools),

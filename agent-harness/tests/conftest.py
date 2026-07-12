@@ -32,10 +32,18 @@ def isolate_default_trace_directory(tmp_path, monkeypatch):
 
 
 def pytest_collection_modifyitems(config, items):
-    """Skip live tests during ordinary pytest runs unless the user selects -m live."""
-    if config.option.markexpr == "live":
+    """Classify tests by responsibility and skip external live tests by default."""
+    for item in items:
+        relative = Path(str(item.path)).resolve().relative_to(ROOT.resolve())
+        if relative.parts[0:2] == ("tests", "unit"):
+            item.add_marker(pytest.mark.unit)
+        elif relative.parts[0:2] == ("tests", "integration") and not ({"platform_linux", "platform_windows"} & set(item.keywords)):
+            item.add_marker(pytest.mark.integration_local)
+        elif relative.parts[0:2] == ("tests", "live"):
+            item.add_marker(pytest.mark.live_provider)
+    if config.option.markexpr in {"live", "live_provider", "live_oauth"}:
         return
     skip_live = pytest.mark.skip(reason="live tests run only with pytest -m live")
     for item in items:
-        if "live" in item.keywords:
+        if {"live", "live_provider", "live_oauth"} & set(item.keywords):
             item.add_marker(skip_live)

@@ -25,7 +25,7 @@ from agent_harness.mcp.naming import canonical_tool_name
 from agent_harness.mcp.pagination import collect_paginated
 from agent_harness.mcp.results import normalize_tool_result
 from agent_harness.mcp.schema_validation import check_mcp_schema, validate_mcp_value
-from agent_harness.mcp.models import MCPPromptRecord, MCPResourceRecord, MCPServerConfig, MCPServerSnapshot, MCPServerStatus, MCPToolRecord, MCPTransport
+from agent_harness.mcp.models import MCPPromptRecord, MCPResourceRecord, MCPServerConfig, MCPServerHealth, MCPServerSnapshot, MCPServerStatus, MCPToolRecord, MCPTransport
 
 AuditSink = Callable[[str, dict[str, Any]], None]
 
@@ -39,10 +39,12 @@ class MCPServerConnection:
         self.roots = tuple(root.resolve() for root in roots)
         self.audit = audit
         self.status = MCPServerStatus.NOT_CONNECTED if config.enabled else MCPServerStatus.DISABLED
+        self.health = MCPServerHealth.HEALTHY
         self.session: ClientSession | None = None
         self.initialize_result: types.InitializeResult | None = None
-        self._stack: AsyncExitStack | None = None
         self._http_client: httpx.AsyncClient | None = None
+        self._transport_task: asyncio.Task[None] | None = None
+        self._transport_stop: asyncio.Event | None = None
         self.tools: tuple[MCPToolRecord, ...] = ()
         self.resources: tuple[MCPResourceRecord, ...] = ()
         self.prompts: tuple[MCPPromptRecord, ...] = ()
@@ -54,6 +56,13 @@ class MCPServerConnection:
         self._refresh_lock = asyncio.Lock()
         self._reconnect_lock = asyncio.Lock()
         self._closing = False
+        self._has_catalog_snapshot = False
+        self.generation = 0
+
+    @property
+    def is_usable(self) -> bool:
+        """Return whether an initialized session and last-good catalog are available."""
+        return self.session is not None and self._has_catalog_snapshot and self.status in {MCPServerStatus.READY, MCPServerStatus.DEGRADED}
 
     async def connect(self) -> None:
         """Open transport, initialize the protocol, and discover declared catalogs."""
@@ -61,35 +70,24 @@ class MCPServerConnection:
             return
         self.status = MCPServerStatus.CONNECTING
         self._emit("mcp.server_connecting", {"server": self.config.name, "transport": self.config.transport.value})
-        stack = AsyncExitStack()
-        self._stack = stack
+        loop = asyncio.get_running_loop()
+        ready: asyncio.Future[None] = loop.create_future()
+        self._transport_stop = asyncio.Event()
+        self._transport_task = asyncio.create_task(self._transport_owner(ready, self._transport_stop), name=f"mcp-transport:{self.config.name}")
         try:
-            read, write = await asyncio.wait_for(self._open_transport(stack), timeout=self.config.startup_timeout_seconds)
-            session = ClientSession(
-                read,
-                write,
-                read_timeout_seconds=timedelta(seconds=self.config.tool_timeout_seconds),
-                list_roots_callback=cast(ListRootsFnT, self._list_roots),
-                message_handler=cast(MessageHandlerFnT, self._handle_message),
-            )
-            self.session = await stack.enter_async_context(session)
-            self.initialize_result = await asyncio.wait_for(self.session.initialize(), timeout=self.config.startup_timeout_seconds)
+            await asyncio.wait_for(asyncio.shield(ready), timeout=self.config.startup_timeout_seconds)
             await self.refresh_catalogs()
             self.status = MCPServerStatus.READY
             self._emit("mcp.server_ready", {"server": self.config.name, "tool_count": len(self.tools), "resource_count": len(self.resources), "prompt_count": len(self.prompts)})
         except asyncio.CancelledError:
             self.status = MCPServerStatus.STOPPING
-            await stack.aclose()
-            self._stack = None
-            self.session = None
+            await self._stop_transport()
             self._emit("mcp.server_connect_cancelled", {"server": self.config.name})
             raise
         except Exception as exc:
             self.error = str(exc)
             self.status = MCPServerStatus.FAILED
-            await stack.aclose()
-            self._stack = None
-            self.session = None
+            await self._stop_transport()
             self._emit("mcp.server_failed", {"server": self.config.name, "error": self.error})
             raise MCPConnectionError(f"MCP server {self.config.name} failed: {exc}") from exc
 
@@ -102,36 +100,52 @@ class MCPServerConnection:
             capabilities = self.initialize_result.capabilities
             page_counts: list[int] = []
             truncated = False
+            candidate_tools = self.tools
+            candidate_resources = self.resources
+            candidate_templates = self.resource_templates
+            candidate_prompts = self.prompts
             try:
                 if capabilities.tools is not None:
                     raw_tools, pages, cut = await collect_paginated(lambda cursor: self._require_session().list_tools(cursor=cursor), get_items=lambda page: page.tools, get_next_cursor=lambda page: page.nextCursor, max_pages=100, max_items=2000, on_page=self._page_loaded)
                     records = tuple(self._tool_record(tool) for tool in raw_tools if self._tool_enabled(tool.name))
                     self._assert_unique_names(records)
-                    self.tools = records
+                    candidate_tools = records
                     page_counts.append(pages)
                     truncated |= cut
                 if capabilities.resources is not None:
                     raw_resources, pages, cut = await collect_paginated(lambda cursor: self._require_session().list_resources(cursor=cursor), get_items=lambda page: page.resources, get_next_cursor=lambda page: page.nextCursor, max_pages=100, max_items=5000, on_page=self._page_loaded)
-                    self.resources = tuple(MCPResourceRecord(self.config.name, str(item.uri), item.name, item.description or "", item.mimeType) for item in raw_resources)
+                    candidate_resources = tuple(MCPResourceRecord(self.config.name, str(item.uri), item.name, item.description or "", item.mimeType) for item in raw_resources)
                     page_counts.append(pages)
                     truncated |= cut
                     raw_templates, pages, cut = await collect_paginated(lambda cursor: self._require_session().list_resource_templates(cursor=cursor), get_items=lambda page: page.resourceTemplates, get_next_cursor=lambda page: page.nextCursor, max_pages=100, max_items=5000, on_page=self._page_loaded)
-                    self.resource_templates = tuple(item.model_dump(mode="json", by_alias=True, exclude_none=True) for item in raw_templates)
+                    candidate_templates = tuple(item.model_dump(mode="json", by_alias=True, exclude_none=True) for item in raw_templates)
                     page_counts.append(pages)
                     truncated |= cut
                 if capabilities.prompts is not None:
                     raw_prompts, pages, cut = await collect_paginated(lambda cursor: self._require_session().list_prompts(cursor=cursor), get_items=lambda page: page.prompts, get_next_cursor=lambda page: page.nextCursor, max_pages=100, max_items=1000, on_page=self._page_loaded)
-                    self.prompts = tuple(MCPPromptRecord(self.config.name, item.name, item.description or "", tuple(arg.model_dump(by_alias=True, exclude_none=True) for arg in (item.arguments or []))) for item in raw_prompts)
+                    candidate_prompts = tuple(MCPPromptRecord(self.config.name, item.name, item.description or "", tuple(arg.model_dump(by_alias=True, exclude_none=True) for arg in (item.arguments or []))) for item in raw_prompts)
                     page_counts.append(pages)
                     truncated |= cut
             except asyncio.CancelledError:
                 self._emit("mcp.catalog_refresh_cancelled", {"server": self.config.name})
                 raise
+            except Exception as exc:
+                if self._has_catalog_snapshot:
+                    self.catalog_stale = True
+                    self.health = MCPServerHealth.DEGRADED
+                    self.error = str(exc)
+                    self._emit("mcp.catalog_refresh_failed", {"server": self.config.name, "preserved_last_good": True, "error_type": type(exc).__name__})
+                raise
+            self.tools = candidate_tools
+            self.resources = candidate_resources
+            self.resource_templates = candidate_templates
+            self.prompts = candidate_prompts
             self.catalog_page_count = sum(page_counts)
             self.catalog_truncated = truncated
             self.catalog_stale = False
+            self._has_catalog_snapshot = True
+            self.health = MCPServerHealth.DEGRADED if truncated else MCPServerHealth.HEALTHY
             if truncated:
-                self.status = MCPServerStatus.DEGRADED
                 self._emit("mcp.catalog_truncated", {"server": self.config.name})
             self._emit("mcp.catalog_refresh_completed", {"server": self.config.name, "pages": self.catalog_page_count})
 
@@ -143,13 +157,14 @@ class MCPServerConnection:
         if record:
             validate_mcp_value(arguments, record.input_schema, label="input")
         self._emit("mcp.tool_call_started", {"server": self.config.name, "tool": name})
+        observed_generation = self.generation
         try:
             result = await asyncio.wait_for(self._require_session().call_tool(name, arguments), timeout=self.config.tool_timeout_seconds)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             if self._is_session_not_found(exc):
-                await self._reinitialize("session_not_found")
+                await self._reinitialize("session_not_found", observed_generation)
                 self._emit("mcp.tool_outcome_unknown", {"server": self.config.name, "tool": name})
                 raise MCPToolOutcomeUnknown("MCP session expired during tool execution; the outcome is unknown and was not retried") from exc
             raise MCPTransportError(str(exc)) from exc
@@ -175,18 +190,65 @@ class MCPServerConnection:
 
     async def close(self) -> None:
         """Gracefully close the SDK session and underlying transport resources."""
-        if not self._stack:
+        if not self._transport_task:
             return
         self._closing = True
         self.status = MCPServerStatus.STOPPING
         try:
-            await asyncio.wait_for(self._stack.aclose(), timeout=self.config.cleanup_timeout_seconds)
+            await self._stop_transport()
         finally:
-            self._stack = None
-            self.session = None
             self.status = MCPServerStatus.STOPPED
             self._closing = False
             self._emit("mcp.server_stopped", {"server": self.config.name})
+
+    async def _transport_owner(self, ready: asyncio.Future[None], stop: asyncio.Event) -> None:
+        """Enter and exit SDK transport contexts in one stable owner task."""
+        stack = AsyncExitStack()
+        try:
+            read, write = await self._open_transport(stack)
+            session = ClientSession(
+                read,
+                write,
+                read_timeout_seconds=timedelta(seconds=self.config.tool_timeout_seconds),
+                list_roots_callback=cast(ListRootsFnT, self._list_roots),
+                message_handler=cast(MessageHandlerFnT, self._handle_message),
+            )
+            self.session = await stack.enter_async_context(session)
+            self.initialize_result = await self.session.initialize()
+            self.generation += 1
+            if not ready.done():
+                ready.set_result(None)
+            await stop.wait()
+        except BaseException as exc:
+            if not ready.done():
+                ready.set_exception(exc)
+            elif not isinstance(exc, asyncio.CancelledError) and not self._closing:
+                self.error = str(exc)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+        finally:
+            try:
+                await stack.aclose()
+            finally:
+                self.session = None
+
+    async def _stop_transport(self) -> None:
+        """Signal the owner task and wait a bounded time for same-task cleanup."""
+        task = self._transport_task
+        stop = self._transport_stop
+        if task is None:
+            return
+        if stop is not None:
+            stop.set()
+        try:
+            await asyncio.wait_for(task, timeout=self.config.cleanup_timeout_seconds)
+        except asyncio.TimeoutError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        finally:
+            self._transport_task = None
+            self._transport_stop = None
+            self.session = None
 
     def snapshot(self) -> MCPServerSnapshot:
         """Build a credential-free server snapshot suitable for thread persistence."""
@@ -212,6 +274,9 @@ class MCPServerConnection:
             len(instructions),
             identity_hash,
             tuple({**item, "name_hash": item["canonical_name"].rsplit("__", 1)[-1]} for item in catalog_payload),
+            self.health,
+            self.catalog_stale,
+            self.generation,
         )
 
     async def _open_transport(self, stack: AsyncExitStack) -> tuple[Any, Any]:
@@ -282,6 +347,7 @@ class MCPServerConnection:
 
     async def _execute_with_session_recovery(self, operation: Callable[[], Any]) -> Any:
         """Retry one read-only operation once after rebuilding an expired HTTP session."""
+        observed_generation = self.generation
         try:
             return await operation()
         except asyncio.CancelledError:
@@ -289,12 +355,15 @@ class MCPServerConnection:
         except Exception as exc:
             if not self._is_session_not_found(exc):
                 raise MCPTransportError(str(exc)) from exc
-            await self._reinitialize("session_not_found")
+            await self._reinitialize("session_not_found", observed_generation)
             return await operation()
 
-    async def _reinitialize(self, reason: str) -> None:
+    async def _reinitialize(self, reason: str, observed_generation: int) -> None:
         """Serialize a fresh transport, initialize handshake, and catalog snapshot."""
         async with self._reconnect_lock:
+            if self.generation != observed_generation and self.is_usable:
+                self._emit("mcp.session_reinitialize_reused", {"server": self.config.name, "reason": reason, "generation": self.generation})
+                return
             self._emit("mcp.session_expired", {"server": self.config.name, "reason": reason})
             await self.close()
             self.status = MCPServerStatus.RECONNECTING
@@ -310,6 +379,8 @@ class MCPServerConnection:
                 return True
             current = current.__cause__ or current.__context__
         message = str(exc).casefold()
+        if message.strip() == "session terminated":
+            return True
         return "404" in message and any(marker in message for marker in ("session", "not found", "invalid"))
 
     def _assert_unique_names(self, records: tuple[MCPToolRecord, ...]) -> None:

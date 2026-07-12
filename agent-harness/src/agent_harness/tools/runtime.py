@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
-import hashlib
+from dataclasses import asdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -10,13 +11,15 @@ from typing import Any, Callable
 
 from agent_harness.domain.errors import HarnessError, ToolAuthorizationError, ToolInputValidationError, ToolTimeoutError
 from agent_harness.domain.messages import ToolCall
-from agent_harness.domain.tools import ToolResult
-from agent_harness.security.approval import ApprovalDecision, ApprovalHandler, ApprovalRequest, DenyApprovalHandler
+from agent_harness.domain.tools import ToolDefinition, ToolResult
+from agent_harness.security.approval import ApprovalDecision, ApprovalHandler, ApprovalRequest, DenyApprovalHandler, TurnCancellationRequested, redact_approval_arguments
+from agent_harness.security.approval_grants import ApprovalGrantStore
 from agent_harness.security.hooks import HookDecision, HookManager
-from agent_harness.security.models import ApprovalPolicy, PermissionDecision, RiskLevel, SandboxPolicy, ToolExecutionPrincipal
+from agent_harness.security.models import ApprovalPolicy, PermissionDecision, SandboxPolicy, ToolExecutionPrincipal
 from agent_harness.security.permission_engine import PermissionEngine
 from agent_harness.tools.registry import ToolRegistry
 from agent_harness.utils.time import duration_ms, utc_now
+from agent_harness.artifacts.store import ArtifactSource, ArtifactStore
 
 
 @dataclass(slots=True)
@@ -29,8 +32,8 @@ class ToolRuntime:
     workspace_root: Path = Path(".")
     sandbox_policy_factory: Callable[[ToolExecutionPrincipal], SandboxPolicy] | None = None
     audit: Callable[[str, dict[str, Any]], None] | None = None
-    _turn_grants: set[tuple[str, str, str]] = field(default_factory=set)
-    _thread_grants: set[tuple[str, str]] = field(default_factory=set)
+    approval_grants: ApprovalGrantStore = field(default_factory=ApprovalGrantStore)
+    artifact_store: ArtifactStore | None = None
     _executed_approvals: set[str] = field(default_factory=set)
 
     async def execute(self, call: ToolCall, principal: ToolExecutionPrincipal | None = None) -> ToolResult:
@@ -54,13 +57,15 @@ class ToolRuntime:
             elif hook_decision == HookDecision.ASK and evaluation.decision == PermissionDecision.ALLOW:
                 evaluation.decision = PermissionDecision.ASK
                 evaluation.reason = "PreToolUse hook requested approval"
-            await self._authorize_or_approve(call, definition.risk_level, definition.required_capabilities, args, principal, evaluation.decision, evaluation.reason)
+            await self._authorize_or_approve(call, definition, args, principal, evaluation.decision, evaluation.reason)
             if definition.requires_sandbox:
                 self._emit("sandbox.started", {"tool": call.name, "tool_call_id": call.id, "sandbox_mode": principal.sandbox_mode.value})
                 self._emit("command.started", {"tool_call_id": call.id, "program": args.get("program"), "arg_count": len(args.get("args", [])), "cwd": args.get("cwd", ".")})
             output = await asyncio.wait_for(definition.executor(args), timeout=definition.timeout_seconds)
             if definition.output_schema is not None:
                 self._validate_schema_value(output, definition.output_schema, "output")
+            if definition.metadata.get("mcp_server") and isinstance(output, dict) and self.artifact_store:
+                output = await self._externalize_mcp_binary(output, principal, call, str(definition.metadata["mcp_server"]))
             output_data = output if isinstance(output, dict) else {}
             if definition.requires_sandbox:
                 self._emit("command.completed", {"tool_call_id": call.id, "exit_code": output_data.get("exit_code"), "timed_out": output_data.get("timed_out"), "truncated": output_data.get("truncated")})
@@ -74,9 +79,13 @@ class ToolRuntime:
             metadata: dict[str, Any] = {"output": output}
             if len(content) > self.max_result_chars:
                 if definition.metadata.get("mcp_server"):
-                    artifact = self._write_mcp_artifact(principal, call.name, content)
-                    content = content[: min(2000, self.max_result_chars)] + f"\n[完整结果已保存为 Artifact: {artifact['artifact_id']}]"
-                    metadata.update(artifact)
+                    if self.artifact_store:
+                        artifact = await self._write_mcp_artifact(principal, call, content, str(definition.metadata["mcp_server"]))
+                        content = content[: min(2000, self.max_result_chars)] + f"\n[完整结果已保存为 Artifact: {artifact['artifact_id']}]"
+                        metadata.update(artifact)
+                    else:
+                        content = content[: self.max_result_chars] + "\n[truncated: no thread ArtifactStore]"
+                        metadata["truncated"] = True
                 else:
                     content = content[: self.max_result_chars] + "\n[truncated]"
                     metadata["truncated"] = True
@@ -100,41 +109,51 @@ class ToolRuntime:
                 str(exc),
             )
 
-    async def _authorize_or_approve(self, call: ToolCall, risk_level: RiskLevel, required_capabilities: frozenset, args: dict[str, Any], principal: ToolExecutionPrincipal, decision: PermissionDecision, reason: str) -> None:
+    async def _authorize_or_approve(self, call: ToolCall, definition: ToolDefinition, args: dict[str, Any], principal: ToolExecutionPrincipal, decision: PermissionDecision, reason: str) -> None:
         """Reject denied calls or resolve ASK through a narrow idempotent approval."""
         if decision == PermissionDecision.DENY:
             self._emit("permission.denied", {"tool": call.name, "tool_call_id": call.id, "reason": reason})
             raise ToolAuthorizationError(reason, details={"tool": call.name, "agent_id": principal.agent_id})
-        if decision != PermissionDecision.ASK or self._has_grant(principal, call.name):
+        if decision != PermissionDecision.ASK or self.approval_grants.allows(principal, call.name, args):
             return
         if principal.approval_policy == ApprovalPolicy.NEVER:
             raise ToolAuthorizationError("Approval policy never rejects ASK decisions", details={"tool": call.name})
+        redacted = redact_approval_arguments(args)
         request = ApprovalRequest(
             principal=principal,
             tool_call_id=call.id,
             tool_name=call.name,
             reason=reason,
-            risk_level=risk_level,
-            requested_capabilities=required_capabilities,
-            command_preview=tuple([str(args.get("program")), *map(str, args.get("args", []))]) if args.get("program") else (),
-            path_preview=tuple(str(args[name]) for name in ("path", "cwd") if name in args),
+            risk_level=definition.risk_level,
+            requested_capabilities=definition.required_capabilities,
+            command_preview=tuple([str(redacted.get("program")), *map(str, redacted.get("args", []))]) if redacted.get("program") else (),
+            path_preview=tuple(str(redacted[name]) for name in ("path", "cwd") if name in redacted),
+            argument_preview=redacted,
+            config_scope=definition.metadata.get("mcp_scope"),
+            server_name=definition.metadata.get("mcp_server"),
+            identity_summary=definition.metadata.get("mcp_identity_summary"),
+            remote_tool_name=definition.metadata.get("mcp_remote_tool"),
+            canonical_tool_name=call.name,
+            effective_approval_mode=definition.metadata.get("mcp_approval_mode"),
+            approval_source=definition.metadata.get("mcp_approval_source"),
+            side_effect=definition.side_effect,
+            annotations=dict(definition.metadata.get("mcp_annotations", {})),
+            annotations_trusted=bool(definition.metadata.get("mcp_annotation_trusted", False)),
         )
-        self._emit("approval.requested", {"approval_id": request.approval_id, "tool_call_id": call.id, "tool": call.name, "agent_id": principal.agent_id})
+        self._emit("approval.requested", {"approval_id": request.approval_id, "tool_call_id": call.id, "tool": call.name, "agent_id": principal.agent_id, "thread_id": principal.thread_id, "turn_id": principal.turn_id, "config_scope": request.config_scope, "server": request.server_name, "identity_summary": request.identity_summary, "remote_tool": request.remote_tool_name, "approval_mode": request.effective_approval_mode, "approval_source": request.approval_source, "side_effect": request.side_effect.value, "annotations": request.annotations, "annotations_trusted": request.annotations_trusted, "arguments": request.argument_preview})
         approval = await self.approval_handler.request(request)
         self._emit("approval.decided", {"approval_id": request.approval_id, "tool_call_id": call.id, "decision": approval.value})
-        if approval in {ApprovalDecision.DENY_ONCE, ApprovalDecision.CANCEL_TURN}:
+        if approval == ApprovalDecision.CANCEL_TURN:
+            raise TurnCancellationRequested(request.approval_id, call.name)
+        if approval == ApprovalDecision.DENY_ONCE:
             raise ToolAuthorizationError("User denied tool approval", details={"tool": call.name, "approval_id": request.approval_id})
         if request.approval_id in self._executed_approvals:
             raise ToolAuthorizationError("Approval has already been consumed", details={"approval_id": request.approval_id})
         self._executed_approvals.add(request.approval_id)
         if approval == ApprovalDecision.ALLOW_TURN:
-            self._turn_grants.add((principal.thread_id, principal.turn_id, call.name))
+            self.approval_grants.grant_turn(principal, call.name, args)
         if approval == ApprovalDecision.ALLOW_THREAD:
-            self._thread_grants.add((principal.thread_id, call.name))
-
-    def _has_grant(self, principal: ToolExecutionPrincipal, tool_name: str) -> bool:
-        """Return whether a prior narrow grant covers this tool and scope."""
-        return (principal.thread_id, principal.turn_id, tool_name) in self._turn_grants or (principal.thread_id, tool_name) in self._thread_grants
+            self.approval_grants.grant_thread(principal, call.name, args)
 
     def _sandbox_policy(self, principal: ToolExecutionPrincipal) -> SandboxPolicy:
         """Resolve the policy used by permission checks and sandboxed executors."""
@@ -231,17 +250,29 @@ class ToolRuntime:
             return output
         return json.dumps(output, ensure_ascii=False, indent=2)
 
-    def _write_mcp_artifact(self, principal: ToolExecutionPrincipal, tool_name: str, content: str) -> dict[str, Any]:
-        """Persist an oversized MCP result under the owning thread with a host-generated name."""
-        encoded = content.encode("utf-8")
-        digest = hashlib.sha256(encoded).hexdigest()
-        artifact_id = f"mcp_{digest[:16]}"
-        directory = self.workspace_root / ".harness" / "threads" / principal.thread_id / "artifacts" / "mcp"
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"{artifact_id}.json"
-        path.write_bytes(encoded)
-        self._emit("mcp.artifact_created", {"artifact_id": artifact_id, "tool": tool_name, "size": len(encoded), "sha256": digest})
-        return {"artifact_id": artifact_id, "artifact_path": str(path), "original_size": len(encoded), "mime_type": "application/json", "sha256": digest, "truncated": False}
+    async def _write_mcp_artifact(self, principal: ToolExecutionPrincipal, call: ToolCall, content: str, server_name: str) -> dict[str, Any]:
+        """Persist oversized MCP JSON through the injected thread-owned store."""
+        assert self.artifact_store is not None
+        reference = await self.artifact_store.put_text(content, "application/json", ArtifactSource(principal.thread_id, principal.turn_id, server_name, call.name, call.id))
+        self._emit("mcp.artifact_created", {"artifact_id": reference.artifact_id, "tool": call.name, "size": reference.size_bytes, "sha256": reference.sha256})
+        return {**asdict(reference), "artifact_path": reference.path, "original_size": reference.size_bytes, "truncated": False}
+
+    async def _externalize_mcp_binary(self, output: dict[str, Any], principal: ToolExecutionPrincipal, call: ToolCall, server_name: str) -> dict[str, Any]:
+        """Replace MCP image/audio base64 payloads with bounded host artifact references."""
+        assert self.artifact_store is not None
+        result = copy.deepcopy(output)
+        for channel in ("images", "audio"):
+            replaced: list[dict[str, Any]] = []
+            for item in result.get(channel, []):
+                if not isinstance(item, dict) or not isinstance(item.get("data"), str):
+                    replaced.append(item)
+                    continue
+                mime_type = str(item.get("mimeType") or item.get("mime_type") or "application/octet-stream")
+                reference = await self.artifact_store.put_base64(item["data"], mime_type, ArtifactSource(principal.thread_id, principal.turn_id, server_name, call.name, call.id))
+                replaced.append({"type": item.get("type", channel.rstrip("s")), "artifact": asdict(reference)})
+                self._emit("mcp.artifact_created", {"artifact_id": reference.artifact_id, "tool": call.name, "size": reference.size_bytes, "sha256": reference.sha256})
+            result[channel] = replaced
+        return result
 
     def _result(
         self,

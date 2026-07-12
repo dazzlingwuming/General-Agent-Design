@@ -4,11 +4,19 @@ import asyncio
 import os
 import shutil
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from agent_harness.sandbox.base import CommandExecution, CommandResult
 from agent_harness.sandbox.process import terminate_process_tree, truncate_streams
 from agent_harness.security.models import SandboxMode, SandboxPolicy
+
+
+def windows_path_to_wsl(path: PureWindowsPath) -> PurePosixPath:
+    """Translate an absolute Windows drive path without consulting the host OS."""
+    drive = path.drive.rstrip(":").lower()
+    if not drive or not path.is_absolute():
+        raise ValueError(f"Cannot translate path to WSL: {path}")
+    return PurePosixPath("/mnt", drive, *path.parts[1:])
 
 
 @dataclass(slots=True)
@@ -120,9 +128,7 @@ class WslBubblewrapSandboxBackend(BubblewrapSandboxBackend):
 
     def _wsl_path(self, path: Path) -> str:
         """Convert a resolved drive path into its conventional WSL mount path."""
-        resolved = path.resolve()
-        drive = resolved.drive.rstrip(":").lower()
-        if not drive:
-            raise RuntimeError(f"Cannot translate path to WSL: {resolved}")
-        tail = PurePosixPath(*resolved.parts[1:])
-        return str(PurePosixPath("/mnt", drive, tail))
+        try:
+            return str(windows_path_to_wsl(PureWindowsPath(path.resolve())))
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
