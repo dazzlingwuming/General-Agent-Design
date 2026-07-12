@@ -58,6 +58,8 @@ class ToolRuntime:
                 self._emit("sandbox.started", {"tool": call.name, "tool_call_id": call.id, "sandbox_mode": principal.sandbox_mode.value})
                 self._emit("command.started", {"tool_call_id": call.id, "program": args.get("program"), "arg_count": len(args.get("args", [])), "cwd": args.get("cwd", ".")})
             output = await asyncio.wait_for(definition.executor(args), timeout=definition.timeout_seconds)
+            if definition.output_schema is not None:
+                self._validate_schema_value(output, definition.output_schema, "output")
             output_data = output if isinstance(output, dict) else {}
             if definition.requires_sandbox:
                 self._emit("command.completed", {"tool_call_id": call.id, "exit_code": output_data.get("exit_code"), "timed_out": output_data.get("timed_out"), "truncated": output_data.get("truncated")})

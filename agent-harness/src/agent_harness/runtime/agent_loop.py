@@ -185,7 +185,16 @@ class AgentLoop:
         """Build the execution principal for the current agent and turn."""
         capabilities = {Capability.FILE_READ}
         if self.agent.name == "coding_assistant":
-            capabilities.update({Capability.FILE_WRITE, Capability.FILE_DELETE, Capability.COMMAND_EXECUTE})
+            capabilities.update(
+                {
+                    Capability.FILE_WRITE,
+                    Capability.FILE_DELETE,
+                    Capability.COMMAND_EXECUTE,
+                    Capability.MCP_TOOL_CALL,
+                    Capability.NETWORK_ACCESS,
+                    Capability.EXTERNAL_SIDE_EFFECT,
+                }
+            )
         if self.agent.can_spawn_subagents:
             capabilities.add(Capability.SUBAGENT_CREATE)
         return ToolExecutionPrincipal(

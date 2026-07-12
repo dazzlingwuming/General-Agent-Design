@@ -18,6 +18,54 @@ class WorkspaceTrustState(StrEnum):
     UNTRUSTED = "untrusted"
 
 
+class TrustDecisionSource(StrEnum):
+    """Origin used to resolve the effective workspace trust decision."""
+
+    INTERACTIVE = "interactive"
+    PERSISTED = "persisted"
+    USER_CONFIG = "user_config"
+    DEFAULT = "default"
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectTrustContext:
+    """Carry independent project capability gates derived from workspace trust."""
+
+    workspace_status: WorkspaceTrustState
+    source: TrustDecisionSource
+    guidance_allowed: bool
+    skills_allowed: bool
+    mcp_allowed: bool
+    project_config_allowed: bool
+    project_stdio_allowed: bool
+
+    @property
+    def workspace_trusted(self) -> bool:
+        """Return whether repository-controlled executable configuration is trusted."""
+        return self.workspace_status in {WorkspaceTrustState.TRUSTED_ONCE, WorkspaceTrustState.TRUSTED}
+
+
+def resolve_project_trust(
+    status: WorkspaceTrustState,
+    source: TrustDecisionSource,
+    *,
+    guidance_requires_trust: bool,
+    skills_require_trust: bool,
+    mcp_requires_trust: bool,
+) -> ProjectTrustContext:
+    """Resolve separate subsystem gates without weakening project stdio execution."""
+    trusted = status in {WorkspaceTrustState.TRUSTED_ONCE, WorkspaceTrustState.TRUSTED}
+    return ProjectTrustContext(
+        workspace_status=status,
+        source=source,
+        guidance_allowed=trusted or not guidance_requires_trust,
+        skills_allowed=trusted or not skills_require_trust,
+        mcp_allowed=trusted or not mcp_requires_trust,
+        project_config_allowed=trusted or not mcp_requires_trust,
+        project_stdio_allowed=trusted,
+    )
+
+
 @dataclass(slots=True)
 class WorkspaceTrustStore:
     """Persist trust by canonical workspace identity and keep once grants in memory."""

@@ -16,6 +16,7 @@ from agent_harness.turns.state import InputItem, ThreadStatus
 from agent_harness.utils.serialization import to_jsonable
 from agent_harness.project.roots import resolve_project_paths
 from agent_harness.skills.invocation import SkillInvocationRequest, SkillInvocationSource
+from agent_harness.guidance.trust import ProjectTrustContext, TrustDecisionSource, WorkspaceTrustState, resolve_project_trust
 
 
 @dataclass(slots=True)
@@ -30,6 +31,7 @@ class ConversationSession:
     live_thread: LiveThread | None = None
     store: LocalThreadStore = field(init=False)
     project_trusted: bool = False
+    trust_context: ProjectTrustContext | None = None
 
     def __post_init__(self) -> None:
         """Initialize the local thread store used by this conversation wrapper."""
@@ -73,7 +75,9 @@ class ConversationSession:
         self.state = RunState(task="", workspace_root=paths.workspace_root)
         self.state.run_id = live.state.thread_id
         self.manager.rollout_audit = lambda event, payload: self._record_audit_item(event, None, payload)
-        self.manager.initialize_project_context(self.thread_id, paths.cwd, project_trusted=self.project_trusted)
+        self.trust_context = self.trust_context or self._legacy_trust_context()
+        self.manager.initialize_project_context(self.thread_id, paths.cwd, trust_context=self.trust_context)
+        await self.manager.initialize_mcp()
         self.manager.rollout_audit = None
 
     async def resume(self, thread_id: str) -> None:
@@ -88,7 +92,9 @@ class ConversationSession:
         self.manager.rollout_audit = lambda event, payload: self._record_audit_item(event, None, payload)
         resume_cwd = live.state.cwd or live.state.workspace_root
         self.manager.project_paths = resolve_project_paths(resume_cwd, live.state.workspace_root)
-        self.manager.initialize_project_context(self.thread_id, resume_cwd, project_trusted=self.project_trusted, resume=True)
+        self.trust_context = self.trust_context or self._legacy_trust_context()
+        self.manager.initialize_project_context(self.thread_id, resume_cwd, trust_context=self.trust_context, resume=True)
+        await self.manager.initialize_mcp()
         self.manager.rollout_audit = None
 
     async def run_turn(self, user_input: str) -> RunState:
@@ -160,9 +166,21 @@ class ConversationSession:
         """Mark the live runtime closed without deleting its canonical history."""
         if self.live_thread is None:
             return
+        await self.manager.close_mcp()
         self.live_thread.state.status = ThreadStatus.CLOSED
         await self.live_thread.update_metadata({"status": ThreadStatus.CLOSED, "active_turn_id": None})
         await self.live_thread.shutdown()
+
+    def _legacy_trust_context(self) -> ProjectTrustContext:
+        """Convert the compatibility boolean into independent subsystem trust gates."""
+        status = WorkspaceTrustState.TRUSTED if self.project_trusted else WorkspaceTrustState.UNKNOWN
+        return resolve_project_trust(
+            status,
+            TrustDecisionSource.INTERACTIVE if self.project_trusted else TrustDecisionSource.DEFAULT,
+            guidance_requires_trust=self.config.guidance.require_workspace_trust,
+            skills_require_trust=self.config.skills.require_workspace_trust,
+            mcp_requires_trust=self.config.mcp.require_workspace_trust,
+        )
 
     async def _ensure_started(self) -> None:
         """Create a thread lazily when callers run a turn without an explicit start."""

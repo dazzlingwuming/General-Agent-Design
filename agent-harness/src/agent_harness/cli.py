@@ -20,6 +20,11 @@ from agent_harness.security.approval import ConsoleApprovalHandler
 from agent_harness.security.models import ApprovalPolicy, SandboxMode
 from agent_harness.utils.serialization import to_jsonable
 from agent_harness.guidance.trust import WorkspaceTrustState, WorkspaceTrustStore
+from agent_harness.mcp.auth import KeyringTokenStorage
+from agent_harness.utils.atomic_files import atomic_write_json
+from agent_harness.mcp.config import parse_server_config
+from agent_harness.mcp.models import MCPConfigScope
+from agent_harness.mcp.connection import MCPServerConnection
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -95,6 +100,24 @@ def build_parser() -> argparse.ArgumentParser:
     migrate = sub.add_parser("migrate-sessions")
     migrate.add_argument("--session-dir", default=".harness/sessions")
     migrate.add_argument("--thread-dir", default=".harness/threads")
+    mcp = sub.add_parser("mcp")
+    mcp_sub = mcp.add_subparsers(dest="mcp_command", required=True)
+    mcp_sub.add_parser("list")
+    mcp_get = mcp_sub.add_parser("get")
+    mcp_get.add_argument("name")
+    mcp_add = mcp_sub.add_parser("add")
+    mcp_add.add_argument("name")
+    mcp_add.add_argument("target")
+    mcp_add.add_argument("server_args", nargs="*")
+    mcp_add.add_argument("--transport", choices=["stdio", "streamable_http"], default="stdio")
+    mcp_add.add_argument("--bearer-token-env-var")
+    mcp_add.add_argument("--oauth", action="store_true")
+    mcp_remove = mcp_sub.add_parser("remove")
+    mcp_remove.add_argument("name")
+    mcp_logout = mcp_sub.add_parser("logout")
+    mcp_logout.add_argument("name")
+    mcp_login = mcp_sub.add_parser("login")
+    mcp_login.add_argument("name")
     return parser
 
 
@@ -383,7 +406,7 @@ def _resolve_workspace_trust(workspace: Path, config) -> bool:
         return True
     has_project_config = any(
         path.exists()
-        for path in (workspace / "AGENTS.md", workspace / "AGENTS.override.md", workspace / "CLAUDE.md", workspace / ".agents")
+        for path in (workspace / "AGENTS.md", workspace / "AGENTS.override.md", workspace / "CLAUDE.md", workspace / ".agents", workspace / ".mcp.json")
     )
     if not has_project_config:
         return False
@@ -403,6 +426,19 @@ def _resolve_workspace_trust(workspace: Path, config) -> bool:
 
 def _phase4_command(command: str, session: ConversationSession) -> bool:
     """Handle Guidance, Skills, and Trust inspection commands in an idle CLI thread."""
+    if command == "/mcp":
+        runtime = session.manager.mcp_runtime
+        if not runtime:
+            print("当前 Thread 未启用 MCP Runtime。")
+            return True
+        for row in runtime.status_rows():
+            print(
+                f"{row['name']}: {row['status']} transport={row['transport']} "
+                f"tools={row['tool_count']} resources={row['resource_count']} prompts={row['prompt_count']}"
+            )
+        for blocked in runtime.resolved.blocked:
+            print(f"{blocked.name}: blocked_untrusted scope={blocked.scope.value}")
+        return True
     if command == "/trust":
         print("Workspace Trust：" + ("trusted" if session.project_trusted else "untrusted"))
         return True
@@ -586,6 +622,82 @@ def _migrate_one_session(metadata: dict, transcript: Path, target: Path) -> None
             handle.write(json.dumps(to_jsonable(item), ensure_ascii=False) + "\n")
 
 
+def _mcp_config_path() -> Path:
+    """Return the user-scoped MCP JSON file managed by CLI commands."""
+    return default_user_config_path().parent / "mcp.json"
+
+
+def _read_mcp_rows() -> dict[str, dict]:
+    """Read user MCP definitions and recover from a missing configuration file."""
+    path = _mcp_config_path()
+    if not path.exists():
+        return {}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    rows = raw.get("mcpServers", {}) if isinstance(raw, dict) else {}
+    return {str(name): dict(value) for name, value in rows.items() if isinstance(value, dict)}
+
+
+def _write_mcp_rows(rows: dict[str, dict]) -> None:
+    """Atomically persist user MCP definitions without credential values."""
+    atomic_write_json(_mcp_config_path(), {"mcpServers": rows})
+
+
+async def _mcp_command(args: argparse.Namespace) -> int:
+    """Manage user-scoped MCP definitions and secure OAuth credentials."""
+    rows = _read_mcp_rows()
+    if args.mcp_command == "list":
+        for name, row in sorted(rows.items()):
+            target = row.get("url") or row.get("command")
+            print(f"{name}\t{row.get('transport', 'stdio')}\t{target}\t{'enabled' if row.get('enabled', True) else 'disabled'}")
+        return 0
+    if args.mcp_command == "get":
+        found = rows.get(args.name)
+        if found is None:
+            print(f"未找到 MCP Server：{args.name}")
+            return 1
+        print(json.dumps(found, ensure_ascii=False, indent=2))
+        return 0
+    if args.mcp_command == "add":
+        if args.transport == "stdio":
+            row = {"transport": "stdio", "command": args.target, "args": args.server_args}
+        else:
+            row = {"transport": "streamable_http", "url": args.target}
+            if args.bearer_token_env_var:
+                row["bearer_token_env_var"] = args.bearer_token_env_var
+            if args.oauth:
+                row["auth_mode"] = "oauth"
+        rows[args.name] = row
+        _write_mcp_rows(rows)
+        print(f"已保存 MCP Server：{args.name}")
+        return 0
+    if args.mcp_command == "remove":
+        if rows.pop(args.name, None) is None:
+            print(f"未找到 MCP Server：{args.name}")
+            return 1
+        _write_mcp_rows(rows)
+        print(f"已移除 MCP Server：{args.name}")
+        return 0
+    if args.mcp_command == "logout":
+        await KeyringTokenStorage(args.name).clear()
+        print(f"已清除 MCP OAuth 凭据：{args.name}")
+        return 0
+    if args.mcp_command == "login":
+        found = rows.get(args.name)
+        if found is None:
+            print(f"未找到 MCP Server：{args.name}")
+            return 1
+        config = parse_server_config(args.name, found, MCPConfigScope.USER, Path.cwd())
+        if config.auth_mode != "oauth":
+            print("该 MCP Server 未配置 auth_mode=oauth。")
+            return 1
+        connection = MCPServerConnection(config, (Path.cwd(),))
+        await connection.connect()
+        await connection.close()
+        print(f"MCP OAuth 授权成功：{args.name}")
+        return 0
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     """Dispatch the CLI command and return a process exit code."""
     parser = build_parser()
@@ -621,6 +733,8 @@ def main(argv: list[str] | None = None) -> int:
         return _inspect(args)
     if args.command == "migrate-sessions":
         return _migrate_sessions(args)
+    if args.command == "mcp":
+        return asyncio.run(_mcp_command(args))
     parser.print_help()
     return 2
 

@@ -122,6 +122,18 @@ class SkillsConfig:
 
 
 @dataclass(slots=True)
+class MCPConfig:
+    """MCP host discovery, trust, connection, and disclosure settings."""
+
+    enabled: bool = True
+    require_workspace_trust: bool = True
+    connect_in_parallel: bool = True
+    max_parallel_connections: int = 4
+    tool_disclosure: str = "auto"
+    servers: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class HarnessConfig:
     """Top-level configuration object shared by CLI and runtime code."""
 
@@ -135,6 +147,7 @@ class HarnessConfig:
     security: SecurityConfig = field(default_factory=SecurityConfig)
     guidance: GuidanceConfig = field(default_factory=GuidanceConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
+    mcp: MCPConfig = field(default_factory=MCPConfig)
 
 
 MODEL_ALIASES = {
@@ -276,6 +289,15 @@ def load_config(path: Path | None = None) -> HarnessConfig:
             str(item.get("id")) for item in skills_data.get("config", []) if isinstance(item, dict) and item.get("enabled") is False
         ),
     )
+    mcp_data = _section(raw, "mcp")
+    mcp = MCPConfig(
+        enabled=bool(mcp_data.get("enabled", True)),
+        require_workspace_trust=bool(mcp_data.get("require_workspace_trust", True)),
+        connect_in_parallel=bool(mcp_data.get("connect_in_parallel", True)),
+        max_parallel_connections=int(mcp_data.get("max_parallel_connections", 4)),
+        tool_disclosure=str(mcp_data.get("tool_disclosure", "auto")),
+        servers=dict(_section(mcp_data, "servers")),
+    )
     trace_data = _section(raw, "trace")
     trace = TraceConfig(
         directory=Path(trace_data.get("directory", ".harness/runs")),
@@ -291,7 +313,7 @@ def load_config(path: Path | None = None) -> HarnessConfig:
     if env_url := os.getenv("DEEPSEEK_API_URL"):
         provider.base_url = env_url
     provider.model = normalize_model_name(provider.model)
-    return HarnessConfig(provider, agent, run, tools, context, trace, subagents, security, guidance, skills)
+    return HarnessConfig(provider, agent, run, tools, context, trace, subagents, security, guidance, skills, mcp)
 
 
 def _load_permission_rules(raw: dict[str, Any], *, is_user_config: bool, trusted_project: bool) -> list[PermissionRule]:
