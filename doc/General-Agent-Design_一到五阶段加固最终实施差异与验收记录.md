@@ -64,6 +64,13 @@ git diff --check                                     passed
 - 跨进程恢复旧 HTTP MCP Session ID；
 - Context Compaction、通用 Unified Diff Parser；
 - 外部 OAuth provider 与真实 DeepSeek live smoke；
-- 对应 commit SHA 的 GitHub Actions 绿色结果，在改动推送前不得写为已通过。
+- 外部 OAuth provider 与真实 DeepSeek live smoke 不属于默认 CI。
 
-准确状态是：一到五阶段本方案规定的三批加固已完成本地确定性实现与验收；沙箱和方案明确延期能力仍未完成。
+## GitHub Actions 验收
+
+- Commit：`7c59c158a2ba860683ea890a22548ec0c476e141`
+- Workflow Run：`https://github.com/dazzlingwuming/General-Agent-Design/actions/runs/29184509102`
+- Conclusion：`success`
+- Jobs：Ubuntu/Windows core、Linux platform。
+
+准确状态是：一到五阶段本方案规定的三批加固已完成本地确定性实现、真实本地协议验收和对应 SHA 的 GitHub CI 验收；沙箱和方案明确延期能力仍未完成。

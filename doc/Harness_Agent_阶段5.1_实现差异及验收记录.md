@@ -110,6 +110,8 @@ stdio:      real official-SDK lifecycle and pagination passed
 HTTP:       real Streamable HTTP lifecycle, 404 recovery, no-replay and pagination passed
 OAuth:      local loopback PKCE/refresh/invalid_grant/logout passed
 diff check: passed
+GitHub CI:  success for 7c59c158a2ba860683ea890a22548ec0c476e141
+Run:        https://github.com/dazzlingwuming/General-Agent-Design/actions/runs/29184509102
 ```
 
 新增针对性覆盖包括：

@@ -17,7 +17,7 @@
 1. 本地验收使用现有 CPython 3.12.7；Workflow 固定使用文档要求的 Python 3.11。Python 3.11 的最终结果必须由 GitHub runner 或独立干净环境证明。
 2. Windows/WSL 平台测试在本机因 WSL distribution 中没有 bubblewrap 而跳过。只证明测试分类正确，不代表 WSL 沙箱通过。
 3. 核心测试有一个 symlink 测试因当前 Windows 权限不允许创建符号链接而跳过。skip reason 明确，Ubuntu CI 应实际执行该测试。
-4. 当前没有对应未提交改动 SHA 的 GitHub Actions 运行，因此只能记录本地通过，不能记录 CI 已完成。
+4. 后续完整实现提交 `7c59c158a2ba860683ea890a22548ec0c476e141` 已取得 GitHub Actions 绿色结果。
 5. 包版本仍为 `0.1.0`。版本提升属于发布策略，不用版本号代替阶段完成状态。
 
 ## 本地验收
@@ -39,10 +39,11 @@ uv run --no-sync python -m pytest -q -rs
 97 passed, 4 skipped
 ```
 
-## 尚未完成
+## 远端验收
 
-- 推送后取得对应 commit SHA 的 Ubuntu/Windows 核心门禁和 Linux 平台门禁绿色记录。
-- 在具备 WSL2 和 bubblewrap 的 Windows 环境执行 `platform_windows` 验收。
-- 根据正式发布策略决定是否提升包版本。
+- Workflow Run：`https://github.com/dazzlingwuming/General-Agent-Design/actions/runs/29184509102`
+- Commit：`7c59c158a2ba860683ea890a22548ec0c476e141`
+- Conclusion：`success`
+- 覆盖 Ubuntu/Windows core 与 Linux platform jobs。
 
-在上述 CI 记录产生前，第一批状态是“实现和本地质量门完成，远端正式验收待完成”。
+仍不属于该 CI 证明的事项：具备 WSL2+bubblewrap 的 Windows platform acceptance，以及正式发布版本提升。
