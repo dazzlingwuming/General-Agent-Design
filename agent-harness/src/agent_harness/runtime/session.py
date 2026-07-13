@@ -28,6 +28,8 @@ from agent_harness.checkpoints.serializer import restore_run_state
 from agent_harness.checkpoints.models import ResumePoint
 from agent_harness.recovery.coordinator import RecoveryCoordinator, RecoveryDisposition
 from agent_harness.compaction.service import CompactionService
+from agent_harness.domain.model import Usage
+from agent_harness.utils.time import utc_now
 
 
 @dataclass(slots=True)
@@ -188,14 +190,7 @@ class ConversationSession:
         input_item = InputItem(text=user_input)
         self.live_thread.state.turn_count += 1
         self.state.turn_count = self.live_thread.state.turn_count
-        self.state.turn_id = turn_id
-        self.state.task = user_input
-        self.state.final_output = None
-        self.state.error = None
-        self.state.iteration = 0
-        self.state.model_call_count = 0
-        self.state.tool_call_count = 0
-        self.state.status = RunStatus.CREATED
+        _reset_state_for_new_turn(self.state, turn_id=turn_id, task=user_input)
         self.state.messages.append(CanonicalMessage(role="user", content=user_input))
         await self._inject_pending_external_context(turn_id)
         controller = TurnController(self.live_thread, turn_id, self._item, self._write_turn_summary)
@@ -397,3 +392,22 @@ def _messages_from_history(history: list[RolloutItem]) -> list[CanonicalMessage]
 def create_session_trace(session_id: str, session_root: Path, config: HarnessConfig) -> JsonlTraceSink:
     """Create a trace sink whose run_id is the stable interactive thread id."""
     return JsonlTraceSink(session_id, session_root, fail_on_write_error=config.trace.fail_on_write_error)
+
+
+def _reset_state_for_new_turn(state: RunState, *, turn_id: str, task: str) -> None:
+    """Reset fields owned by one turn while preserving thread history and identity."""
+    now = utc_now()
+    state.turn_id = turn_id
+    state.task = task
+    state.status = RunStatus.CREATED
+    state.iteration = 0
+    state.model_call_count = 0
+    state.tool_call_count = 0
+    state.usage_total = Usage()
+    state.started_at = now
+    state.updated_at = now
+    state.completed_at = None
+    state.final_output = None
+    state.error = None
+    state.cancellation_requested = False
+    state.agent_summary = None

@@ -33,6 +33,8 @@ def restore_run_state(payload: dict[str, Any], workspace_root: Any) -> RunState:
         output_tokens=usage.get("output_tokens"),
         total_tokens=usage.get("total_tokens"),
         cached_input_tokens=usage.get("cached_input_tokens"),
+        cache_miss_input_tokens=usage.get("cache_miss_input_tokens"),
+        reasoning_tokens=usage.get("reasoning_tokens"),
         provider_details=dict(usage.get("provider_details") or {}),
     )
     state.final_output = payload.get("final_output")

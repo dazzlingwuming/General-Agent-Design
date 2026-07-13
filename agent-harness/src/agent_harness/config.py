@@ -182,6 +182,22 @@ class CompactionConfig:
 
 
 @dataclass(slots=True)
+class TuiConfig:
+    """Interactive transcript and status-line preferences with plain fallbacks."""
+
+    enabled: bool = True
+    plain_output: bool = False
+    show_progress: bool = True
+    show_tool_output_lines: int = 8
+    show_model_calls: bool = True
+    show_checkpoints: bool = False
+    show_memory_events: bool = False
+    status_line: tuple[str, ...] = ("phase", "model", "context-remaining", "turn-tokens", "thread-tokens", "estimated-cost", "permissions")
+    color: str = "auto"
+    unicode: bool = True
+
+
+@dataclass(slots=True)
 class HarnessConfig:
     """Top-level configuration object shared by CLI and runtime code."""
 
@@ -200,6 +216,7 @@ class HarnessConfig:
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
+    tui: TuiConfig = field(default_factory=TuiConfig)
 
 
 MODEL_ALIASES = {
@@ -391,6 +408,15 @@ def load_config(path: Path | None = None) -> HarnessConfig:
         session_directory=Path(trace_data.get("session_directory", ".harness/sessions")),
         fail_on_write_error=bool(trace_data.get("fail_on_write_error", True)),
     )
+    tui_data = _section(raw, "tui")
+    tui = TuiConfig(
+        enabled=bool(tui_data.get("enabled", True)), plain_output=bool(tui_data.get("plain_output", False)),
+        show_progress=bool(tui_data.get("show_progress", True)), show_tool_output_lines=int(tui_data.get("show_tool_output_lines", 8)),
+        show_model_calls=bool(tui_data.get("show_model_calls", True)), show_checkpoints=bool(tui_data.get("show_checkpoints", False)),
+        show_memory_events=bool(tui_data.get("show_memory_events", False)),
+        status_line=tuple(tui_data.get("status_line", TuiConfig().status_line)), color=str(tui_data.get("color", "auto")),
+        unicode=bool(tui_data.get("unicode", True)),
+    )
 
     if env_model := os.getenv("AGENT_HARNESS_MODEL"):
         provider.model = normalize_model_name(env_model)
@@ -399,7 +425,7 @@ def load_config(path: Path | None = None) -> HarnessConfig:
     if env_url := os.getenv("DEEPSEEK_API_URL"):
         provider.base_url = env_url
     provider.model = normalize_model_name(provider.model)
-    return HarnessConfig(provider, agent, run, tools, context, trace, subagents, security, guidance, skills, mcp, artifacts, persistence, memory, compaction)
+    return HarnessConfig(provider, agent, run, tools, context, trace, subagents, security, guidance, skills, mcp, artifacts, persistence, memory, compaction, tui)
 
 
 def _load_permission_rules(raw: dict[str, Any], *, is_user_config: bool, trusted_project: bool) -> list[PermissionRule]:

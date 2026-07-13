@@ -28,7 +28,8 @@ def test_deepseek_reasoning_content_round_trips(monkeypatch):
                 },
             }
         ],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3, "prompt_cache_hit_tokens": 1,
+            "prompt_cache_miss_tokens": 0, "completion_tokens_details": {"reasoning_tokens": 1}},
     }
 
     parsed = provider._parse_response(raw)
@@ -38,6 +39,9 @@ def test_deepseek_reasoning_content_round_trips(monkeypatch):
     assert parsed.provider_metadata["reasoning_content"] == "我需要先读取文件。"
     assert serialized["reasoning_content"] == "我需要先读取文件。"
     assert serialized["tool_calls"][0]["id"] == "call_1"
+    assert parsed.usage.cached_input_tokens == 1
+    assert parsed.usage.cache_miss_input_tokens == 0
+    assert parsed.usage.reasoning_tokens == 1
 
 
 def test_deepseek_to_provider_message_preserves_existing_tool_call_reasoning(monkeypatch):

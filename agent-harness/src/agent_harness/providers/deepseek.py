@@ -36,7 +36,7 @@ class DeepSeekProvider:
             supports_strict_tool_schema=False,
             supports_json_output=True,
             supports_usage=True,
-            max_context_tokens=64000,
+            max_context_tokens=1_000_000,
         )
     )
 
@@ -148,10 +148,14 @@ class DeepSeekProvider:
             tool_calls=tool_calls,
         )
         usage_raw = raw.get("usage") or {}
+        completion_details = usage_raw.get("completion_tokens_details") or {}
         usage = Usage(
             input_tokens=usage_raw.get("prompt_tokens"),
             output_tokens=usage_raw.get("completion_tokens"),
             total_tokens=usage_raw.get("total_tokens"),
+            cached_input_tokens=usage_raw.get("prompt_cache_hit_tokens"),
+            cache_miss_input_tokens=usage_raw.get("prompt_cache_miss_tokens"),
+            reasoning_tokens=completion_details.get("reasoning_tokens"),
             provider_details=usage_raw,
         )
         finish = choice.get("finish_reason") or "unknown"

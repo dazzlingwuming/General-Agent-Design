@@ -24,6 +24,8 @@ def write_result_summary(run: RunState, run_dir: Path, trace_path: Path) -> Path
         "model_call_count": run.model_call_count,
         "tool_call_count": run.tool_call_count,
         "usage": run.usage_total,
+        "usage_scope": "turn",
+        "context": {"last_input_tokens": run.usage_total.input_tokens, "estimated": False},
         "final_output": run.final_output,
         "error": run.error,
         "trace_path": trace_path,

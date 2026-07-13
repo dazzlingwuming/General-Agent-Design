@@ -14,6 +14,8 @@ class Usage:
     output_tokens: int | None = None
     total_tokens: int | None = None
     cached_input_tokens: int | None = None
+    cache_miss_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
     provider_details: dict[str, Any] = field(default_factory=dict)
 
 

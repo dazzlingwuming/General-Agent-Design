@@ -59,6 +59,7 @@ from agent_harness.checkpoints.manager import CheckpointManager
 from agent_harness.checkpoints.store import CheckpointStore
 from agent_harness.checkpoints.models import ResumePoint
 from agent_harness.memory.store import MemoryStore, project_identity, render_memories
+from agent_harness.tracing.bus import RuntimeEventBus
 
 
 class SubsystemInitState(StrEnum):
@@ -95,6 +96,7 @@ class RunManager:
     checkpoint_store: CheckpointStore | None = None
     memory_store: MemoryStore | None = None
     resume_point: ResumePoint | None = None
+    event_bus: RuntimeEventBus = field(default_factory=RuntimeEventBus)
 
     async def run(self, task: str, workspace: Path) -> RunState:
         """Create a run state, wire dependencies, execute the loop, and save summary."""
@@ -122,7 +124,7 @@ class RunManager:
             checkpoint_manager = CheckpointManager(self.checkpoint_store, state.run_id, self.config.provider.name, self.config.provider.model)
             checkpoint_manager.resume_sequence(state.turn_id)
         paths = self.project_paths or resolve_project_paths(root, root)
-        trace = JsonlTraceSink(state.run_id, trace_root, fail_on_write_error=self.config.trace.fail_on_write_error)
+        trace = JsonlTraceSink(state.run_id, trace_root, fail_on_write_error=self.config.trace.fail_on_write_error, event_bus=self.event_bus)
         self.ensure_artifact_store((trace_root / state.run_id / "artifacts").resolve())
         trace.emit(
             "run.created" if state.turn_count <= 1 else "turn.created",

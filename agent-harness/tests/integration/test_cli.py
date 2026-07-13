@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agent_harness.cli import main
+from agent_harness.cli import _clean_terminal_input, main
 
 
 def test_cli_tools_lists_builtin_tools(capsys):
@@ -50,3 +50,8 @@ def test_cli_setup_writes_user_config(tmp_path, monkeypatch, capsys):
     assert "deepseek-v4-pro" in content
     assert "api_key_env" in content
     assert "secret-value" not in content
+
+
+def test_cli_normalizes_invalid_windows_pipe_surrogates():
+    """Prevent redirected PowerShell input from corrupting UTF-8 trace persistence."""
+    assert _clean_terminal_input("task\udcae") == "task?"

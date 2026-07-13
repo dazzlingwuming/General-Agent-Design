@@ -15,9 +15,10 @@ from agent_harness.tools.runtime import ToolExecutionPrincipal, ToolRuntime
 from agent_harness.security.models import ApprovalPolicy, Capability, SandboxMode
 from agent_harness.tracing.jsonl import JsonlTraceSink
 from agent_harness.runtime.budgets import check_iteration, check_model_calls, check_tool_calls, check_wall_time
-from agent_harness.utils.time import utc_now
+from agent_harness.utils.time import duration_ms, utc_now
 from agent_harness.checkpoints.manager import CheckpointManager, stable_action_id
 from agent_harness.checkpoints.models import DurableTurnStatus, ResumePoint
+from agent_harness.tracing.pricing import pricing_snapshot
 
 
 @dataclass(slots=True)
@@ -49,7 +50,7 @@ class AgentLoop:
         terminal_tool_names = self.terminal_tool_names | policy.terminal_tool_names()
         state.status = RunStatus.RUNNING
         state.updated_at = utc_now()
-        self.trace.emit("run.started", payload={"agent": self.agent.name})
+        self.trace.emit("turn.started", thread_id=state.run_id, turn_id=state.turn_id, payload={"agent": self.agent.name, "turn_id": state.turn_id})
         try:
             if self.resume_point == ResumePoint.BEFORE_FINALIZE:
                 return self._resume_finalization(state)
@@ -71,25 +72,39 @@ class AgentLoop:
                 if continuing_iteration:
                     response = self._committed_model_response(state)
                     self.resume_point = None
-                    self.trace.emit("model.response_reused", iteration=state.iteration, payload={"tool_call_count": len(response.tool_calls)})
+                    self.trace.emit("model.response.reused", iteration=state.iteration, thread_id=state.run_id, turn_id=state.turn_id,
+                        payload={"tool_call_count": len(response.tool_calls), "turn_id": state.turn_id})
                 else:
                     self._checkpoint(state, ResumePoint.BEFORE_MODEL)
+                    self.trace.emit("context.build.started", iteration=state.iteration, thread_id=state.run_id, turn_id=state.turn_id,
+                        payload={"turn_id": state.turn_id})
                     request = self.context_builder.build(state, self.agent, self.tool_runtime.registry)
+                    estimated_tokens = round(sum(len(message.content or "") for message in request.messages) / self.context_builder.char_to_token_ratio)
                     self.trace.emit(
-                        "context.built",
+                        "context.build.completed",
                         iteration=state.iteration,
-                        payload={"message_count": len(request.messages), "tool_count": len(request.tools)},
+                        thread_id=state.run_id, turn_id=state.turn_id,
+                        payload={"message_count": len(request.messages), "tool_schema_count": len(request.tools), "turn_id": state.turn_id,
+                            "estimated_input_tokens": estimated_tokens, "estimate_method": "chars_ratio"},
                     )
                     check_model_calls(state, self.agent.limits)
-                    self.trace.emit("model.requested", iteration=state.iteration, payload={"model": request.model})
+                    model_started = utc_now()
+                    self.trace.emit("model.request.started", iteration=state.iteration, thread_id=state.run_id, turn_id=state.turn_id,
+                        payload={"provider": self.provider.name, "model": request.model, "turn_id": state.turn_id})
                     state.model_call_count += 1
                     self._checkpoint(state, ResumePoint.MODEL_IN_FLIGHT)
                     response = await self.provider.complete(request)
                     self._add_usage(state, response.usage)
+                    price = pricing_snapshot(self.provider.name, response.model or request.model)
                     self.trace.emit(
-                        "model.completed",
+                        "model.response.completed",
                         iteration=state.iteration,
-                        payload={"finish_reason": response.finish_reason, "tool_call_count": len(response.tool_calls)},
+                        thread_id=state.run_id, turn_id=state.turn_id,
+                        payload={"provider": self.provider.name, "model": response.model or request.model, "response_id": response.response_id,
+                            "finish_reason": response.finish_reason, "tool_call_count": len(response.tool_calls),
+                            "duration_ms": duration_ms(model_started, utc_now()), "usage": response.usage,
+                            "context_window_tokens": getattr(self.provider.capabilities, "max_context_tokens", None), "turn_id": state.turn_id,
+                            "pricing_snapshot": price},
                     )
                     state.messages.append(response.assistant_message)
                     self._checkpoint(state, ResumePoint.AFTER_MODEL)
@@ -101,8 +116,12 @@ class AgentLoop:
                         check_tool_calls(state, self.agent.limits)
                         action_id = stable_action_id(state.run_id, state.turn_id or "turn_unknown", call.id)
                         self._checkpoint(state, ResumePoint.BEFORE_TOOL, pending_action_ids=(action_id,))
-                        self.trace.emit("tool.requested", iteration=state.iteration, payload={"tool": call.name, "tool_call_id": call.id})
-                        self.trace.emit("tool.started", iteration=state.iteration, payload={"tool": call.name, "tool_call_id": call.id})
+                        common_tool = {"tool_name": call.name, "tool_call_id": call.id, "logical_action_id": action_id, "turn_id": state.turn_id,
+                            "arguments": call.arguments}
+                        self.trace.emit("tool.requested", iteration=state.iteration, thread_id=state.run_id, turn_id=state.turn_id,
+                            logical_action_id=action_id, correlation_id=call.id, payload=common_tool)
+                        self.trace.emit("tool.execution.started", iteration=state.iteration, thread_id=state.run_id, turn_id=state.turn_id,
+                            logical_action_id=action_id, correlation_id=call.id, payload=common_tool)
                         self._checkpoint(state, ResumePoint.TOOL_IN_FLIGHT, pending_action_ids=(action_id,))
                         result = await self.tool_runtime.execute(call, self._principal(state))
                         if result.status == "success" and self.tool_success_callback and isinstance(call.arguments, dict):
@@ -120,6 +139,10 @@ class AgentLoop:
                         self._checkpoint(state, ResumePoint.AFTER_TOOL)
                         self._drain_mailbox(state)
                         if result.status == "success" and call.name in terminal_tool_names:
+                            self.trace.emit("tool.execution.completed", iteration=state.iteration, thread_id=state.run_id, turn_id=state.turn_id,
+                                logical_action_id=action_id, correlation_id=call.id,
+                                payload={**common_tool, "status": result.status, "duration_ms": result.duration_ms,
+                                    "output_chars": len(result.content), "output_preview": result.content[:4000]})
                             state.final_output = result.content
                             state.status = RunStatus.COMPLETED
                             state.completed_at = utc_now()
@@ -133,9 +156,9 @@ class AgentLoop:
                             self.trace.emit("iteration.completed", iteration=state.iteration, payload={"continued": False})
                             self._checkpoint(state, ResumePoint.TERMINAL, DurableTurnStatus.COMPLETED)
                             return state
-                        event_name = "tool.completed" if result.status == "success" else "tool.failed"
+                        event_name = "tool.execution.completed" if result.status == "success" else "tool.execution.failed"
                         if result.status == "timeout":
-                            event_name = "tool.timed_out"
+                            event_name = "tool.execution.timed_out"
                         self.trace.emit(
                             event_name,
                             iteration=state.iteration,
@@ -145,7 +168,13 @@ class AgentLoop:
                                 "status": result.status,
                                 "error_code": result.error_code,
                                 "duration_ms": result.duration_ms,
+                                "tool_name": result.tool_name,
+                                "logical_action_id": action_id,
+                                "output_chars": len(result.content),
+                                "output_preview": result.content[:4000],
+                                "turn_id": state.turn_id,
                             },
+                            thread_id=state.run_id, turn_id=state.turn_id, logical_action_id=action_id, correlation_id=call.id,
                         )
                     self.trace.emit("iteration.completed", iteration=state.iteration, payload={"continued": True})
                     continue
@@ -159,12 +188,15 @@ class AgentLoop:
                     self.trace.emit("iteration.completed", iteration=state.iteration, payload={"continued": True, "guarded": True})
                     continue
                 state.final_output = final_text
+                self.trace.emit("turn.finalizing", iteration=state.iteration, thread_id=state.run_id, turn_id=state.turn_id,
+                    payload={"turn_id": state.turn_id})
                 self._checkpoint(state, ResumePoint.BEFORE_FINALIZE)
                 state.status = RunStatus.COMPLETED
                 state.completed_at = utc_now()
                 state.updated_at = state.completed_at
                 self.trace.emit("iteration.completed", iteration=state.iteration, payload={"continued": False})
-                self.trace.emit("run.completed", iteration=state.iteration, payload={"final_output_chars": len(final_text)})
+                self.trace.emit("turn.completed", iteration=state.iteration, thread_id=state.run_id, turn_id=state.turn_id,
+                    payload={"final_output_chars": len(final_text), "turn_id": state.turn_id})
                 self._checkpoint(state, ResumePoint.TERMINAL, DurableTurnStatus.COMPLETED)
                 return state
             return state
@@ -245,7 +277,14 @@ class AgentLoop:
 
     def _add_usage(self, state: RunState, usage: Usage) -> None:
         """Accumulate provider token usage fields when the provider returns them."""
-        for field_name in ("input_tokens", "output_tokens", "total_tokens", "cached_input_tokens"):
+        for field_name in (
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cached_input_tokens",
+            "cache_miss_input_tokens",
+            "reasoning_tokens",
+        ):
             value = getattr(usage, field_name)
             if value is None:
                 continue

@@ -4,6 +4,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
+from decimal import Decimal
 from typing import Any, cast
 
 
@@ -16,6 +17,8 @@ def to_jsonable(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, dict):
         return {str(k): to_jsonable(v) for k, v in value.items()}

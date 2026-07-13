@@ -13,6 +13,8 @@ dependencies = [
   "mcp>=1.28,<2",
   "keyring>=25.0",
   "jsonschema>=4.23,<5",
+  "prompt-toolkit>=3.0.50,<4",
+  "rich>=14.0,<15",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +25,7 @@ test = [
   "mypy>=1.10.0",
   "types-PyYAML>=6.0.12.20250516",
   "types-jsonschema>=4.23",
+  "types-setuptools>=75.0",
 ]
 
 [project.scripts]

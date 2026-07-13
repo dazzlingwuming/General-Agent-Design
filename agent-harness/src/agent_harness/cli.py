@@ -4,7 +4,13 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
+import sys
 from pathlib import Path
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import WordCompleter
+from rich.console import Console
 
 from agent_harness.config import MODEL_ALIASES, ProviderConfig, default_user_config_path, load_config, normalize_model_name, write_user_config
 from agent_harness.domain.errors import HarnessError
@@ -28,6 +34,7 @@ from agent_harness.mcp.connection import MCPServerConnection
 from agent_harness.checkpoints.store import CheckpointStore
 from agent_harness.recovery.coordinator import RecoveryCoordinator
 from agent_harness.memory.store import MemoryStore, project_identity
+from agent_harness.cli_observability import CliObservability
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -257,23 +264,40 @@ async def _interactive(args: argparse.Namespace) -> int:
     manager = RunManager(config=config, provider=provider, approval_handler=ConsoleApprovalHandler())
     session = ConversationSession(config=config, manager=manager, workspace=Path.cwd(), project_trusted=_resolve_workspace_trust(Path.cwd(), config))
     await session.start()
+    observability = CliObservability(config, session)
+    observability.replay()
+    console = Console(no_color=config.tui.color == "never" or not sys.stdout.isatty(), highlight=False)
+    subscription = manager.event_bus.subscribe(lambda event: _print_trace_cell(console, observability.apply(event)))
+    prompt_session = _prompt_session(observability)
     print(f"Thread ID: {session.session_id}")
     print(f"Workspace: {Path.cwd()}")
     print("输入 /exit 退出，/new 开启新 Thread，/status 查看当前 Thread。")
     try:
         while True:
             try:
-                task = input("\n> ").strip()
+                task = (await _read_prompt(prompt_session, observability)).strip()
             except EOFError:
                 break
             if not task:
                 continue
             if task in {"/exit", "/quit"}:
                 break
+            if task == "/help":
+                _print_output(console, "\n".join(f"  {command}" for command in SLASH_COMMANDS))
+                continue
             if task == "/status":
-                print(f"Thread: {session.session_id}")
-                print(f"Turns: {session.state.turn_count if session.state else 0}")
-                print(f"Rollout: {session.rollout_path}")
+                _print_output(console, observability.status())
+                continue
+            if task.startswith("/usage"):
+                _print_output(console, observability.usage(raw=task.endswith(" raw")))
+                continue
+            if task.startswith("/trace"):
+                mode = task.partition(" ")[2] or "default"
+                _print_output(console, observability.trace(mode))
+                continue
+            if task.startswith("/statusline"):
+                _statusline_command(config, task)
+                _print_output(console, observability.status_line(shutil.get_terminal_size((120, 24)).columns))
                 continue
             if task.startswith("/permissions"):
                 _permissions_command(config, task)
@@ -290,6 +314,10 @@ async def _interactive(args: argparse.Namespace) -> int:
                 await session.close()
                 session = ConversationSession(config=config, manager=manager, workspace=Path.cwd(), project_trusted=_resolve_workspace_trust(Path.cwd(), config))
                 await session.start()
+                subscription.close()
+                observability = CliObservability(config, session)
+                subscription = manager.event_bus.subscribe(lambda event: _print_trace_cell(console, observability.apply(event)))
+                prompt_session = _prompt_session(observability)
                 print(f"New Thread ID: {session.session_id}")
                 continue
             state = await session.run_turn(task)
@@ -301,6 +329,7 @@ async def _interactive(args: argparse.Namespace) -> int:
         print("\n已退出。")
         return 130
     finally:
+        subscription.close()
         await session.close()
         await provider.close()
     return 0
@@ -325,6 +354,11 @@ async def _resume(args: argparse.Namespace) -> int:
     session = ConversationSession(config=config, manager=manager, workspace=Path.cwd(), project_trusted=_resolve_workspace_trust(Path.cwd(), config))
     try:
         await session.resume(thread_id)
+        observability = CliObservability(config, session)
+        observability.replay()
+        console = Console(no_color=config.tui.color == "never" or not sys.stdout.isatty(), highlight=False)
+        subscription = manager.event_bus.subscribe(lambda event: _print_trace_cell(console, observability.apply(event)))
+        prompt_session = _prompt_session(observability)
         print(f"Thread ID: {session.session_id}")
         print(f"Workspace: {session.state.workspace_root if session.state else Path.cwd()}")
         print("输入 /exit 退出，/new 开启新 Thread，/status 查看当前 Thread。")
@@ -333,17 +367,29 @@ async def _resume(args: argparse.Namespace) -> int:
             print("\n已恢复原 Turn：\n" + recovered.final_output)
         while True:
             try:
-                task = input("\n> ").strip()
+                task = (await _read_prompt(prompt_session, observability)).strip()
             except EOFError:
                 break
             if not task:
                 continue
             if task in {"/exit", "/quit"}:
                 break
+            if task == "/help":
+                _print_output(console, "\n".join(f"  {command}" for command in SLASH_COMMANDS))
+                continue
             if task == "/status":
-                print(f"Thread: {session.session_id}")
-                print(f"Turns: {session.state.turn_count if session.state else 0}")
-                print(f"Rollout: {session.rollout_path}")
+                _print_output(console, observability.status())
+                continue
+            if task.startswith("/usage"):
+                _print_output(console, observability.usage(raw=task.endswith(" raw")))
+                continue
+            if task.startswith("/trace"):
+                mode = task.partition(" ")[2] or "default"
+                _print_output(console, observability.trace(mode))
+                continue
+            if task.startswith("/statusline"):
+                _statusline_command(config, task)
+                _print_output(console, observability.status_line(shutil.get_terminal_size((120, 24)).columns))
                 continue
             if task.startswith("/permissions"):
                 _permissions_command(config, task)
@@ -358,8 +404,12 @@ async def _resume(args: argparse.Namespace) -> int:
                 continue
             if task == "/new":
                 await session.close()
+                subscription.close()
                 session = ConversationSession(config=config, manager=manager, workspace=Path.cwd(), project_trusted=_resolve_workspace_trust(Path.cwd(), config))
                 await session.start()
+                observability = CliObservability(config, session)
+                subscription = manager.event_bus.subscribe(lambda event: _print_trace_cell(console, observability.apply(event)))
+                prompt_session = _prompt_session(observability)
                 print(f"New Thread ID: {session.session_id}")
                 continue
             state = await session.run_turn(task)
@@ -368,9 +418,65 @@ async def _resume(args: argparse.Namespace) -> int:
             elif state.error:
                 print(f"\n错误：{state.error.message}")
     finally:
+        if "subscription" in locals():
+            subscription.close()
         await session.close()
         await provider.close()
     return 0
+
+
+SLASH_COMMANDS = (
+    "/status", "/usage", "/usage raw", "/trace", "/trace full", "/trace raw", "/statusline", "/statusline reset",
+    "/permissions", "/sandbox", "/approvals", "/mcp", "/guidance", "/skills", "/new", "/exit", "/help",
+)
+
+
+def _prompt_session(observability: CliObservability) -> PromptSession[str] | None:
+    """Create an enhanced TTY prompt while retaining a plain redirected-input path."""
+    if not sys.stdin.isatty() or not observability.config.tui.enabled or observability.config.tui.plain_output:
+        return None
+    return PromptSession(completer=WordCompleter(SLASH_COMMANDS, sentence=True), complete_while_typing=False)
+
+
+async def _read_prompt(prompt_session: PromptSession[str] | None, observability: CliObservability) -> str:
+    """Read one command asynchronously so the event loop remains available to runtime tasks."""
+    if prompt_session is None:
+        value = await asyncio.to_thread(input, "\n> ")
+        return _clean_terminal_input(value)
+    width = shutil.get_terminal_size((120, 24)).columns
+    value = await prompt_session.prompt_async("\n> ", bottom_toolbar=lambda: observability.status_line(width))
+    return _clean_terminal_input(value)
+
+
+def _clean_terminal_input(value: str) -> str:
+    """Replace invalid Windows pipe surrogates before durable UTF-8 persistence."""
+    return value.encode("utf-8", errors="replace").decode("utf-8")
+
+
+def _print_trace_cell(console: Console, cell: str | None) -> None:
+    """Commit one visible trace cell without allowing renderer errors into runtime code."""
+    if cell:
+        _print_output(console, cell)
+
+
+def _print_output(console: Console, value: str) -> None:
+    """Use Rich on a TTY and encoding-safe plain text for pipes and redirected output."""
+    if sys.stdout.isatty():
+        console.print(value)
+        return
+    encoding = sys.stdout.encoding or "utf-8"
+    print(value.encode(encoding, errors="replace").decode(encoding))
+
+
+def _statusline_command(config, command: str) -> None:
+    """Inspect, reset, or update the process-local status-line field order."""
+    if command == "/statusline reset":
+        config.tui.status_line = type(config.tui)().status_line
+        return
+    if command.startswith("/statusline set "):
+        requested = tuple(item.strip() for item in command.removeprefix("/statusline set ").split(",") if item.strip())
+        allowed = set(type(config.tui)().status_line)
+        config.tui.status_line = tuple(item for item in requested if item in allowed)
 
 
 def _tools(args: argparse.Namespace) -> int:
