@@ -51,15 +51,24 @@ class AgentLoop:
         state.updated_at = utc_now()
         self.trace.emit("run.started", payload={"agent": self.agent.name})
         try:
+            if self.resume_point == ResumePoint.BEFORE_FINALIZE:
+                return self._resume_finalization(state)
             while state.status == RunStatus.RUNNING:
                 if state.cancellation_requested:
                     raise CancellationError("Run cancellation requested")
                 check_wall_time(state, self.agent.limits)
-                check_iteration(state, self.agent.limits)
-                state.iteration += 1
+                continuing_iteration = self.resume_point in {
+                    ResumePoint.AFTER_MODEL,
+                    ResumePoint.WAITING_APPROVAL,
+                    ResumePoint.BEFORE_TOOL,
+                    ResumePoint.AFTER_TOOL,
+                }
+                if not continuing_iteration:
+                    check_iteration(state, self.agent.limits)
+                    state.iteration += 1
                 self._drain_mailbox(state)
                 self.trace.emit("iteration.started", iteration=state.iteration)
-                if self.resume_point == ResumePoint.AFTER_MODEL:
+                if continuing_iteration:
                     response = self._committed_model_response(state)
                     self.resume_point = None
                     self.trace.emit("model.response_reused", iteration=state.iteration, payload={"tool_call_count": len(response.tool_calls)})
@@ -218,6 +227,21 @@ class AgentLoop:
         if message is None:
             raise ProviderProtocolError("AFTER_MODEL checkpoint has no durable assistant message")
         return ModelResponse(assistant_message=message, tool_calls=list(message.tool_calls), finish_reason="tool_calls" if message.tool_calls else "stop")
+
+    def _resume_finalization(self, state: RunState) -> RunState:
+        """Finish a previously decided turn without invoking the provider or any tool."""
+        self.resume_point = None
+        if state.error is not None:
+            state.status = RunStatus.CANCELLED if state.error.category == "cancellation" else RunStatus.FAILED
+            durable_status = DurableTurnStatus.CANCELLED if state.status == RunStatus.CANCELLED else DurableTurnStatus.FAILED
+        else:
+            state.status = RunStatus.COMPLETED
+            durable_status = DurableTurnStatus.COMPLETED
+        state.completed_at = state.completed_at or utc_now()
+        state.updated_at = state.completed_at
+        self.trace.emit("run.finalization_recovered", iteration=state.iteration, payload={"status": state.status.value})
+        self._checkpoint(state, ResumePoint.TERMINAL, durable_status)
+        return state
 
     def _add_usage(self, state: RunState, usage: Usage) -> None:
         """Accumulate provider token usage fields when the provider returns them."""

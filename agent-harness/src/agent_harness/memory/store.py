@@ -148,10 +148,16 @@ class MemoryStore:
         """Soft-delete content and retain a hash-only tombstone against silent resurrection."""
         now = iso_now()
         with self.database.transaction() as db:
-            row = db.execute("SELECT content_hash FROM memory_records WHERE memory_id=? AND deleted_at IS NULL", (memory_id,)).fetchone()
+            row = db.execute("SELECT content_hash,payload_json FROM memory_records WHERE memory_id=? AND deleted_at IS NULL", (memory_id,)).fetchone()
             if not row:
                 return False
-            db.execute("UPDATE memory_records SET deleted_at=?, content='[DELETED]' WHERE memory_id=?", (now, memory_id))
+            payload = json.loads(row[1])
+            payload.update({"content": "[DELETED]", "structured_data": {}, "source_item_ids": [], "source_artifact_ids": [], "tags": [], "deleted_at": now, "updated_at": now})
+            db.execute(
+                "UPDATE memory_records SET deleted_at=?, content='[DELETED]', payload_json=?, updated_at=? WHERE memory_id=?",
+                (now, json.dumps(payload, ensure_ascii=False, sort_keys=True), now, memory_id),
+            )
+            db.execute("DELETE FROM memory_sources WHERE memory_id=?", (memory_id,))
             db.execute("INSERT OR REPLACE INTO memory_tombstones VALUES(?,?,?,?)", (memory_id, row[0], now, reason))
             if self.fts_enabled:
                 db.execute("DELETE FROM memory_fts WHERE memory_id=?", (memory_id,))

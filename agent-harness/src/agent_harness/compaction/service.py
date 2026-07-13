@@ -59,3 +59,44 @@ class CompactionService:
         state.session_summary = summary
         state.messages = [*protected, *state.messages[boundary:]]
         return record
+
+    def latest(self, thread_id: str) -> CompactionRecord | None:
+        """Load the newest durable compaction record for a thread."""
+        db = self.database.connect()
+        try:
+            row = db.execute(
+                "SELECT payload_json FROM compaction_records WHERE thread_id=? ORDER BY created_at DESC, compaction_id DESC LIMIT 1",
+                (thread_id,),
+            ).fetchone()
+        finally:
+            db.close()
+        if row is None:
+            return None
+        payload = json.loads(row[0])
+        payload["protected_message_ids"] = tuple(payload.get("protected_message_ids") or ())
+        return CompactionRecord(**payload)
+
+    def apply_latest(self, state: RunState) -> CompactionRecord | None:
+        """Verify and reapply the latest compaction to a checkpoint-restored state."""
+        record = self.latest(state.run_id)
+        if record is None:
+            return None
+        if hashlib.sha256(record.summary_text.encode()).hexdigest() != record.summary_hash:
+            raise ValueError("Compaction summary integrity check failed")
+        if state.session_summary and hashlib.sha256(state.session_summary.encode()).hexdigest() == record.summary_hash:
+            return record
+        user_indexes = [index for index, message in enumerate(state.messages) if message.role == "user" and not message.metadata.get("external_context")]
+        if len(user_indexes) <= self.retain_recent_turns:
+            raise ValueError("Compaction source boundary is unavailable")
+        boundary = user_indexes[-self.retain_recent_turns]
+        old = state.messages[:boundary]
+        protected = [message for message in old if message.tool_calls or message.role == "tool"]
+        compactable = [message for message in old if message not in protected]
+        source = "\n".join(f"{message.role}: {message.content}" for message in compactable)
+        if hashlib.sha256(source.encode()).hexdigest() != record.source_hash:
+            raise ValueError("Compaction source integrity check failed")
+        if tuple(message.message_id for message in protected) != record.protected_message_ids:
+            raise ValueError("Compaction protected-message set changed")
+        state.session_summary = record.summary_text
+        state.messages = [*protected, *state.messages[boundary:]]
+        return record

@@ -37,7 +37,9 @@ class RecoveryCoordinator:
         if point == ResumePoint.TERMINAL:
             return RecoveryPlan(checkpoint.checkpoint_id, RecoveryDisposition.TERMINAL, point, "turn already terminal")
         if point == ResumePoint.WAITING_APPROVAL:
-            return RecoveryPlan(checkpoint.checkpoint_id, RecoveryDisposition.WAIT_APPROVAL, point, "original approval remains pending")
+            return RecoveryPlan(checkpoint.checkpoint_id, RecoveryDisposition.CONTINUE, point, "resume the original call and stable approval identity")
+        if point in {ResumePoint.WAITING_SUBAGENT, ResumePoint.PAUSED, ResumePoint.RECOVERY_REQUIRED}:
+            return RecoveryPlan(checkpoint.checkpoint_id, RecoveryDisposition.MANUAL, point, "boundary requires an explicit external decision")
         if point == ResumePoint.TOOL_IN_FLIGHT:
             if tool_policy == ToolRecoveryPolicy.RETRY_SAFE:
                 return RecoveryPlan(checkpoint.checkpoint_id, RecoveryDisposition.RETRY, point, "read-only tool may create a new attempt")

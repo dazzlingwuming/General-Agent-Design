@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import uuid
+from datetime import datetime, timezone
 from dataclasses import replace
 from pathlib import Path
 
@@ -30,6 +33,7 @@ def load_verified(path: Path, *, repair_tail: bool = True) -> list[RolloutItem]:
     previous_hash = ""
     expected_sequence = 1
     valid_bytes = 0
+    v2_started = False
     for index, encoded in enumerate(lines):
         is_last = index == len(lines) - 1
         try:
@@ -37,14 +41,17 @@ def load_verified(path: Path, *, repair_tail: bool = True) -> list[RolloutItem]:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             if repair_tail and is_last:
                 _quarantine_tail(path, raw[valid_bytes:])
-                path.write_bytes(raw[:valid_bytes])
+                _truncate_durably(path, valid_bytes)
                 break
             raise RolloutIntegrityError(f"Malformed rollout row {index + 1}: {exc}") from exc
         item = item_from_dict(data)
         if item.schema_version == 1:
+            if v2_started:
+                raise RolloutIntegrityError(f"Legacy rollout row appears after v2 chain at row {index + 1}")
             items.append(item)
             valid_bytes += len(encoded)
             continue
+        v2_started = True
         if item.sequence_number != expected_sequence:
             raise RolloutIntegrityError(f"Rollout sequence mismatch at row {index + 1}: expected {expected_sequence}, got {item.sequence_number}")
         if item.previous_hash != previous_hash or hash_item(item) != item.item_hash:
@@ -59,5 +66,17 @@ def load_verified(path: Path, *, repair_tail: bool = True) -> list[RolloutItem]:
 def _quarantine_tail(path: Path, tail: bytes) -> None:
     """Preserve a partial final write beside the canonical file for audit."""
     if tail:
-        target = path.with_name(path.name + ".corrupt-tail")
-        target.write_bytes(tail)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        target = path.with_name(path.name + f".corrupt-tail.{stamp}.{uuid.uuid4().hex}")
+        with target.open("xb") as handle:
+            handle.write(tail)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+def _truncate_durably(path: Path, size: int) -> None:
+    """Truncate a repaired rollout and force the new file length to stable storage."""
+    with path.open("r+b") as handle:
+        handle.truncate(size)
+        handle.flush()
+        os.fsync(handle.fileno())

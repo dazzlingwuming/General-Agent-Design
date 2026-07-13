@@ -112,18 +112,50 @@ class ConversationSession:
             checkpoint_store = CheckpointStore((live.state.workspace_root / self.config.persistence.runtime_db).resolve())
             self.manager.checkpoint_store = checkpoint_store
             checkpoint = checkpoint_store.latest(thread_id)
-            if checkpoint and checkpoint.resume_point != ResumePoint.TERMINAL:
+            if checkpoint and checkpoint.resume_point == ResumePoint.TERMINAL:
+                self.state = restore_run_state(checkpoint.serialized_state, live.state.workspace_root)
+                await self._repair_terminal_checkpoint(history)
+                self._apply_latest_compaction()
+            elif checkpoint:
                 plan = RecoveryCoordinator().plan(checkpoint)
                 if plan.disposition in {RecoveryDisposition.CONTINUE, RecoveryDisposition.RETRY}:
                     self.state = restore_run_state(checkpoint.serialized_state, live.state.workspace_root)
                     self.manager.resume_point = checkpoint.resume_point
                     self.incomplete_turn = True
+                    self._apply_latest_compaction()
                 else:
                     live.state.status = ThreadStatus.RECOVERY_REQUIRED
+                    await live.update_metadata({"status": ThreadStatus.RECOVERY_REQUIRED})
         self.trust_context = self.trust_context or self._legacy_trust_context()
         self.manager.initialize_project_context(self.thread_id, resume_cwd, trust_context=self.trust_context, resume=True)
         await self.manager.initialize_mcp()
         self.manager.rollout_audit = None
+
+    async def _repair_terminal_checkpoint(self, history: list[RolloutItem]) -> None:
+        """Close the checkpoint-to-rollout crash window without duplicating a terminal item."""
+        assert self.state is not None
+        assert self.live_thread is not None
+        turn_id = self.state.turn_id or "turn_unknown"
+        terminal_types = {"turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"}
+        terminal_exists = any(item.turn_id == turn_id and item.item_type in terminal_types for item in history)
+        if not terminal_exists:
+            controller = TurnController(self.live_thread, turn_id, self._item, self._write_turn_summary)
+            await controller.finalize_recovered(self.state)
+            return
+        self.live_thread.state.status = ThreadStatus.IDLE
+        self.live_thread.state.active_turn_id = None
+        await self.live_thread.update_metadata({"status": ThreadStatus.IDLE, "active_turn_id": None})
+
+    def _apply_latest_compaction(self) -> None:
+        """Reapply a verified durable compaction after checkpoint restoration."""
+        if not self.config.compaction.enabled or self.state is None or not self.manager.checkpoint_store:
+            return
+        service = CompactionService(
+            self.manager.checkpoint_store.database,
+            retain_recent_turns=self.config.compaction.retain_recent_turns,
+            max_summary_chars=self.config.compaction.max_summary_chars,
+        )
+        service.apply_latest(self.state)
 
     async def continue_incomplete_turn(self) -> RunState | None:
         """Continue the original checkpointed turn without appending a new user turn."""

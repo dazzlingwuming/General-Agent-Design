@@ -51,6 +51,15 @@ class TurnController:
         state.error = CancellationError(reason).to_run_error()
         await self._finalize(state, "turn.cancelled", ItemStatus.CANCELLED)
 
+    async def finalize_recovered(self, state: RunState) -> None:
+        """Finalize a recovered terminal state without rewriting its durable outcome."""
+        if state.status == RunStatus.COMPLETED:
+            await self._finalize(state, "turn.completed", ItemStatus.COMPLETED)
+        elif state.status == RunStatus.CANCELLED:
+            await self._finalize(state, "turn.cancelled", ItemStatus.CANCELLED)
+        else:
+            await self._finalize(state, "turn.failed", ItemStatus.FAILED)
+
     async def interrupt(self, state: RunState, reason: str) -> None:
         """Finalize an explicit runtime interruption distinct from user cancellation."""
         if state.error is None:

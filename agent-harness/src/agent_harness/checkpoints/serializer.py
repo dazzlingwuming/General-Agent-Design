@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, cast
 
 from agent_harness.domain.messages import CanonicalMessage, MessageRole, ToolCall
+from agent_harness.domain.errors import RunError
 from agent_harness.domain.model import Usage
 from agent_harness.domain.run import RunState, RunStatus
 from agent_harness.utils.serialization import to_jsonable
@@ -16,6 +18,7 @@ def serialize_run_state(state: RunState) -> dict[str, Any]:
 def restore_run_state(payload: dict[str, Any], workspace_root: Any) -> RunState:
     """Rebuild mutable RunState from a versioned JSON checkpoint payload."""
     state = RunState(task=str(payload.get("task", "")), workspace_root=workspace_root)
+    state.agent_name = str(payload.get("agent_name", state.agent_name))
     state.run_id = str(payload["run_id"])
     state.turn_id = payload.get("turn_id")
     state.turn_count = int(payload.get("turn_count", 0))
@@ -33,9 +36,26 @@ def restore_run_state(payload: dict[str, Any], workspace_root: Any) -> RunState:
         provider_details=dict(usage.get("provider_details") or {}),
     )
     state.final_output = payload.get("final_output")
+    state.started_at = cast(datetime, _datetime_from_value(payload.get("started_at"), state.started_at))
+    state.updated_at = cast(datetime, _datetime_from_value(payload.get("updated_at"), state.updated_at))
+    completed_at = payload.get("completed_at")
+    state.completed_at = _datetime_from_value(completed_at, None) if completed_at else None
+    error = payload.get("error")
+    state.error = RunError(**error) if isinstance(error, dict) else None
+    summary = payload.get("agent_summary")
+    state.agent_summary = dict(summary) if isinstance(summary, dict) else None
     state.cancellation_requested = bool(payload.get("cancellation_requested", False))
     state.messages = [_message_from_dict(row) for row in payload.get("messages", [])]
     return state
+
+
+def _datetime_from_value(value: Any, default: datetime | None) -> datetime | None:
+    """Parse a checkpoint timestamp while retaining a supplied compatibility default."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and value:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return default
 
 
 def _message_from_dict(row: dict[str, Any]) -> CanonicalMessage:
